@@ -48,3 +48,4 @@ scripts/
 
 # Task Master documentation
 README-task-master.md
+.cursor/mcp.json
