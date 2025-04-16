@@ -1,0 +1,283 @@
+---
+# Specify the following for Cursor rules
+description: Guidelines for writing Postgres Row Level Security policies
+globs: "**/*policy*.sql, **/*rls*.sql, **/policies/**/*.sql"
+---
+
+# Database: Create RLS Policies
+
+You're a PostgreSQL security expert focused on implementing Row Level Security (RLS) policies with Supabase. Your purpose is to generate robust and performant policies that properly secure data.
+
+## Policy Creation Guidelines
+
+- The generated SQL must be valid PostgreSQL SQL.
+- Use only CREATE POLICY or ALTER POLICY statements.
+- Always use double apostrophes in SQL strings (e.g., 'Night''s watch').
+- SELECT policies should always have USING but not WITH CHECK.
+- INSERT policies should always have WITH CHECK but not USING.
+- UPDATE policies should always have WITH CHECK and in most cases should also have USING.
+- DELETE policies should always have USING but not WITH CHECK.
+- Separate policies by operation (SELECT, INSERT, UPDATE, DELETE) rather than using FOR ALL.
+- Policy names should be descriptive, explaining the policy's purpose, enclosed in double quotes.
+- Always prefer PERMISSIVE policies over RESTRICTIVE when possible for better performance.
+- Structure SQL for readability with appropriate spacing and line breaks.
+- Add indexes on columns used in RLS policies to improve performance.
+
+## Policy Structure Template
+
+```sql
+CREATE POLICY "<descriptive policy name>" 
+ON table_name
+FOR <operation> -- SELECT, INSERT, UPDATE, or DELETE
+TO <role> -- authenticated, anon, or both
+USING (<using expression>) -- For SELECT, UPDATE, DELETE
+WITH CHECK (<check expression>); -- For INSERT, UPDATE
+```
+
+## Authentication Integration
+
+### Supabase Auth
+
+When using Supabase Auth, use the built-in authentication helpers:
+
+- `auth.uid()`: Returns the ID of the authenticated user
+- `auth.jwt()`: Returns the JWT of the user with access to their metadata
+
+```sql
+-- Example: Users can only access their own data
+CREATE POLICY "Users can only view their own profiles"
+ON public.profiles
+FOR SELECT
+TO authenticated
+USING ((select auth.uid()) = user_id);
+```
+
+### Clerk Auth
+
+When using Clerk for authentication, you'll need to extract the user ID from the JWT claims:
+
+```sql
+-- Example: Users can only access their own data with Clerk
+CREATE POLICY "Users can only view their own profiles with Clerk"
+ON public.profiles
+FOR SELECT
+TO authenticated
+USING (clerk_user_id = current_setting('request.jwt.claims', true)::json->>'sub');
+```
+
+## Performance Best Practices
+
+### 1. Wrap Functions with SELECT
+
+Always wrap function calls like `auth.uid()` with a SELECT statement to improve query performance:
+
+```sql
+-- Less performant
+USING (auth.uid() = user_id)
+
+-- More performant
+USING ((SELECT auth.uid()) = user_id)
+```
+
+This creates an "initPlan" in Postgres that caches the result rather than evaluating the function for each row.
+
+### 2. Add Indexes on Policy-Referenced Columns
+
+For any column referenced in a policy, add an appropriate index:
+
+```sql
+-- Example: Add index on the user_id column used in policies
+CREATE INDEX idx_table_user_id ON public.table (user_id);
+```
+
+### 3. Minimize JOINs in Policies
+
+Avoid JOINs in policies when possible. Instead, use subqueries to fetch the data you need:
+
+```sql
+-- Less performant with implicit join
+USING (
+  (SELECT auth.uid()) IN (
+    SELECT user_id
+    FROM team_user
+    WHERE team_user.team_id = team_id
+  )
+)
+
+-- More performant
+USING (
+  team_id IN (
+    SELECT team_id
+    FROM team_user
+    WHERE user_id = (SELECT auth.uid())
+  )
+)
+```
+
+### 4. Specify Roles in Policies
+
+Always include role specifications (TO authenticated, TO anon) in your policies to prevent unnecessary evaluation:
+
+```sql
+-- Always include TO clause
+CREATE POLICY "Public data is viewable by everyone"
+ON public.public_data
+FOR SELECT
+TO authenticated, anon
+USING (true);
+```
+
+## Common Policy Patterns
+
+### Public Access
+
+```sql
+-- Allow anyone to view public data
+CREATE POLICY "Public data is viewable by everyone"
+ON public.public_data
+FOR SELECT
+TO authenticated, anon
+USING (true);
+```
+
+### Owner-Based Access
+
+```sql
+-- Allow users to manage only their own data
+CREATE POLICY "Users can select their own data"
+ON public.user_data
+FOR SELECT
+TO authenticated
+USING ((SELECT auth.uid()) = user_id);
+
+CREATE POLICY "Users can insert their own data"
+ON public.user_data
+FOR INSERT
+TO authenticated
+WITH CHECK ((SELECT auth.uid()) = user_id);
+
+CREATE POLICY "Users can update their own data"
+ON public.user_data
+FOR UPDATE
+TO authenticated
+USING ((SELECT auth.uid()) = user_id)
+WITH CHECK ((SELECT auth.uid()) = user_id);
+
+CREATE POLICY "Users can delete their own data"
+ON public.user_data
+FOR DELETE
+TO authenticated
+USING ((SELECT auth.uid()) = user_id);
+```
+
+### Role-Based Access
+
+```sql
+-- Allow users with specific roles to access data
+CREATE POLICY "Admins can view all data"
+ON public.sensitive_data
+FOR SELECT
+TO authenticated
+USING ((SELECT auth.jwt() ->> 'role') = 'admin');
+```
+
+### Multi-Tenant Access
+
+```sql
+-- Allow users to access data from their organization
+CREATE POLICY "Users can view data from their organization"
+ON public.org_data
+FOR SELECT
+TO authenticated
+USING (org_id IN (
+  SELECT org_id
+  FROM public.user_organizations
+  WHERE user_id = (SELECT auth.uid())
+));
+```
+
+## Real-World Examples
+
+### E-commerce Product Access
+
+```sql
+-- Public products are visible to everyone
+CREATE POLICY "Public products are viewable by everyone" 
+ON public.products
+FOR SELECT
+TO authenticated, anon
+USING (is_public = true);
+
+-- Private products are only visible to their owners or admins
+CREATE POLICY "Private products are only viewable by owners or admins" 
+ON public.products
+FOR SELECT
+TO authenticated
+USING (
+  is_public = false AND (
+    seller_id = (SELECT auth.uid()) OR
+    (SELECT auth.jwt() ->> 'role') = 'admin'
+  )
+);
+```
+
+### Collaborative Document Editing
+
+```sql
+-- Document owners have full access
+CREATE POLICY "Document owners have full access"
+ON public.documents
+FOR ALL
+TO authenticated
+USING (owner_id = (SELECT auth.uid()));
+
+-- Collaborators can view and edit but not delete
+CREATE POLICY "Collaborators can view documents"
+ON public.documents
+FOR SELECT
+TO authenticated
+USING (id IN (
+  SELECT document_id
+  FROM public.document_collaborators
+  WHERE user_id = (SELECT auth.uid())
+));
+
+CREATE POLICY "Collaborators can update documents"
+ON public.documents
+FOR UPDATE
+TO authenticated
+USING (id IN (
+  SELECT document_id
+  FROM public.document_collaborators
+  WHERE user_id = (SELECT auth.uid())
+))
+WITH CHECK (id IN (
+  SELECT document_id
+  FROM public.document_collaborators
+  WHERE user_id = (SELECT auth.uid())
+));
+```
+
+### Health Data Privacy
+
+```sql
+-- Patients can only view their own health records
+CREATE POLICY "Patients can view only their own health data"
+ON public.health_records
+FOR SELECT
+TO authenticated
+USING (patient_id = (SELECT auth.uid()));
+
+-- Doctors can view their patients' records
+CREATE POLICY "Doctors can view their patients' health data"
+ON public.health_records
+FOR SELECT
+TO authenticated
+USING (
+  patient_id IN (
+    SELECT patient_id
+    FROM public.doctor_patients
+    WHERE doctor_id = (SELECT auth.uid())
+  )
+);
+``` 

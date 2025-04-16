@@ -1,0 +1,1052 @@
+---
+# Specify the following for Cursor rules
+description: Guidelines for Supabase Storage implementation
+globs: ""**/*storage*.{ts,js,tsx,jsx}, **/storage/**/*.{ts,js,tsx,jsx}, **/*bucket*.{ts,js,tsx,jsx}"
+---
+
+# Supabase Storage
+
+This guide provides best practices for working with Supabase Storage in your applications.
+
+## Storage Organization
+
+### Bucket Structure
+
+Organize your storage with a clear bucket structure:
+
+- Use separate buckets for different content types or access patterns
+- Consider these common bucket types:
+  - `public` - For publicly accessible files
+  - `private` - For authenticated user access only
+  - `protected` - For access via signed URLs only
+  - `uploads` - For temporary user uploads
+  - `avatars` - For user profile images
+  - `media` - For images, videos, and other media
+  - `documents` - For PDFs and other documents
+
+Example bucket structure:
+```
+storage/
+├── public/ (public access, CDN cached)
+│   ├── images/
+│   ├── icons/
+│   └── static/
+├── private/ (authenticated access only)
+│   ├── user-123/
+│   ├── user-456/
+│   └── ...
+├── media/ (images, videos, etc.)
+│   ├── products/
+│   ├── posts/
+│   └── galleries/
+└── documents/ (PDFs, spreadsheets, etc.)
+    ├── reports/
+    ├── invoices/
+    └── contracts/
+```
+
+### Path Naming Conventions
+
+Establish consistent path naming conventions:
+
+- Use lowercase for all paths
+- Use hyphens instead of spaces in filenames
+- Include content type/category directories
+- For user-specific content, include user ID in path
+- For versioned content, include version or timestamp
+- Use UUID or other unique identifiers for uploaded files
+
+Example paths:
+```
+avatars/user-123/profile.jpg
+documents/contracts/user-123/contract-2023-10-15.pdf
+media/products/furniture/chair-wooden-oak.jpg
+uploads/temp/user-123/a671fb56-3399-4d1f-a231-84d16f589223.jpg
+```
+
+## Security Best Practices
+
+### RLS Policies
+
+1. **Default to private**: Start with no public access and add specific policies
+
+```sql
+-- Deny all by default
+CREATE POLICY "Deny all" ON storage.objects
+FOR ALL USING (false);
+
+-- Public read for public bucket
+CREATE POLICY "Public read for public bucket" ON storage.objects
+FOR SELECT USING (
+  bucket_id = 'public'
+);
+
+-- User can read/write their own files
+CREATE POLICY "Users can CRUD their own folder" ON storage.objects
+FOR ALL USING (
+  bucket_id = 'private' 
+  AND auth.uid()::text = (storage.foldername(name))[1]
+);
+
+-- Allow users to read shared files
+CREATE POLICY "Read access to shared files" ON storage.objects
+FOR SELECT USING (
+  bucket_id = 'shared'
+  AND EXISTS (
+    SELECT 1 FROM shared_files
+    WHERE shared_files.file_path = storage.objects.name
+    AND shared_files.shared_with = auth.uid()
+  )
+);
+```
+
+2. **Validate file path structure**: Ensure users can only access their own directories
+
+```sql
+-- Ensure users can only upload to their own directory
+CREATE POLICY "Users can only upload to their own directory" ON storage.objects
+FOR INSERT WITH CHECK (
+  bucket_id = 'private'
+  AND (storage.foldername(name))[1] = auth.uid()::text
+);
+```
+
+3. **Implement additional validation** through middleware or Edge Functions for files that require more complex validation
+
+### Content Type Restrictions
+
+Restrict file types to prevent security issues:
+
+```typescript
+// Client-side validation
+const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+const maxFileSize = 10 * 1024 * 1024; // 10MB
+
+if (!allowedTypes.includes(file.type)) {
+  throw new Error('File type not allowed');
+}
+
+if (file.size > maxFileSize) {
+  throw new Error('File size exceeds the limit');
+}
+
+// Server-side validation with Edge Function
+Deno.serve(async (req) => {
+  try {
+    const formData = await req.formData();
+    const file = formData.get('file');
+    
+    if (!file || !(file instanceof File)) {
+      return new Response(
+        JSON.stringify({ error: 'No file provided' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Validate file type
+    if (!allowedTypes.includes(file.type)) {
+      return new Response(
+        JSON.stringify({ error: 'File type not allowed' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Validate file size
+    if (file.size > maxFileSize) {
+      return new Response(
+        JSON.stringify({ error: 'File too large' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Proceed with upload...
+  } catch (error) {
+    // Error handling...
+  }
+});
+```
+
+### Signed URLs
+
+Use signed URLs for temporary access to private files:
+
+```typescript
+// Generate a signed URL that expires in 60 minutes
+const { data, error } = await supabase
+  .storage
+  .from('private')
+  .createSignedUrl('user-123/document.pdf', 3600);
+
+if (error) {
+  console.error('Error generating signed URL:', error);
+  return;
+}
+
+const signedUrl = data.signedUrl;
+```
+
+For files that should never be accessible directly, use download URLs instead of signed URLs:
+
+```typescript
+// Get a download URL
+const { data, error } = await supabase
+  .storage
+  .from('private')
+  .createSignedUrl('user-123/sensitive-document.pdf', 3600, {
+    download: true,
+    // Optional: rename file when downloaded
+    transform: {
+      disposition: 'attachment; filename="document.pdf"',
+    },
+  });
+```
+
+### Image Transformations
+
+Use image transformations for resizing and optimizing images:
+
+```typescript
+// Resize an image to 300x300, maintaining aspect ratio
+const { data, error } = await supabase
+  .storage
+  .from('public')
+  .createSignedUrl('images/product.jpg', 3600, {
+    transform: {
+      width: 300,
+      height: 300,
+      resize: 'contain',
+    },
+  });
+
+// Resize and convert to WebP
+const webpTransform = {
+  width: 800,
+  height: 600,
+  resize: 'cover',
+  format: 'webp',
+  quality: 80,
+};
+```
+
+## Client Implementation Patterns
+
+### Upload Implementation
+
+A robust upload implementation should include:
+
+1. **Progress tracking**
+2. **Error handling and retry logic**
+3. **File validation**
+4. **Cancellation support**
+
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+// Initialize Supabase client
+const supabaseUrl = 'https://your-project.supabase.co';
+const supabaseKey = 'your-anon-key';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// Upload function with progress tracking
+async function uploadFile(file, bucket, path) {
+  // File validation
+  const maxSize = 100 * 1024 * 1024; // 100MB
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+  
+  if (file.size > maxSize) {
+    throw new Error(`File size exceeds the maximum limit of ${maxSize / (1024 * 1024)}MB`);
+  }
+  
+  if (!allowedTypes.includes(file.type)) {
+    throw new Error(`File type ${file.type} is not allowed`);
+  }
+  
+  // Create an AbortController for cancellation
+  const controller = new AbortController();
+  const { signal } = controller;
+  
+  // Start the upload
+  const uploadPromise = supabase.storage
+    .from(bucket)
+    .upload(path, file, {
+      cacheControl: '3600',
+      upsert: false,
+      contentType: file.type,
+      duplex: 'half', // Enable upload progress in newer browsers
+    });
+  
+  // Return an object with the promise and cancel function
+  return {
+    uploadPromise,
+    cancel: () => controller.abort(),
+  };
+}
+
+// Usage example
+const { uploadPromise, cancel } = uploadFile(
+  myFile, 
+  'private', 
+  `user-${userId}/${uuidv4()}-${myFile.name}`
+);
+
+// Add cancel button event listener
+cancelButton.addEventListener('click', () => {
+  cancel();
+});
+
+// Handle upload result
+try {
+  const { data, error } = await uploadPromise;
+  
+  if (error) {
+    console.error('Upload failed:', error);
+    // Handle error (retry logic, user feedback, etc.)
+    return;
+  }
+  
+  console.log('Upload successful:', data);
+  
+  // Get public URL (for public bucket)
+  const { data: { publicUrl } } = supabase
+    .storage
+    .from('public')
+    .getPublicUrl(data.path);
+    
+  // OR get signed URL (for private bucket)
+  const { data: { signedUrl } } = await supabase
+    .storage
+    .from('private')
+    .createSignedUrl(data.path, 3600);
+    
+  // Update database with file reference
+  await supabase
+    .from('files')
+    .insert({
+      name: myFile.name,
+      size: myFile.size,
+      type: myFile.type,
+      path: data.path,
+      url: publicUrl || signedUrl,
+      owner_id: userId,
+    });
+    
+} catch (error) {
+  if (error.name === 'AbortError') {
+    console.log('Upload was cancelled');
+  } else {
+    console.error('Upload error:', error);
+  }
+}
+```
+
+### Download Implementation
+
+Secure download implementation:
+
+```typescript
+// Function to download a file using a signed URL
+async function downloadFile(bucket, path, filename) {
+  try {
+    // Get a signed URL
+    const { data, error } = await supabase
+      .storage
+      .from(bucket)
+      .createSignedUrl(path, 60, {
+        download: true,
+        transform: {
+          disposition: `attachment; filename="${filename}"`,
+        },
+      });
+      
+    if (error) {
+      throw error;
+    }
+    
+    // Download the file
+    const response = await fetch(data.signedUrl);
+    
+    if (!response.ok) {
+      throw new Error(`Download failed with status: ${response.status}`);
+    }
+    
+    // Create a blob from the response
+    const blob = await response.blob();
+    
+    // Create a download link
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    
+    // Clean up
+    URL.revokeObjectURL(downloadUrl);
+    document.body.removeChild(a);
+    
+    return true;
+  } catch (error) {
+    console.error('Download error:', error);
+    throw error;
+  }
+}
+
+// Usage
+try {
+  await downloadFile('private', `user-${userId}/document.pdf`, 'downloaded-document.pdf');
+  console.log('Download successful');
+} catch (error) {
+  console.error('Download failed:', error.message);
+}
+```
+
+### Listing Files Implementation
+
+Efficiently list files with pagination:
+
+```typescript
+async function listFiles(bucket, path, options = {}) {
+  const {
+    limit = 100,
+    offset = 0,
+    sortBy = { column: 'name', order: 'asc' },
+  } = options;
+  
+  try {
+    const { data, error } = await supabase
+      .storage
+      .from(bucket)
+      .list(path, {
+        limit,
+        offset,
+        sortBy,
+      });
+      
+    if (error) {
+      throw error;
+    }
+    
+    return {
+      files: data,
+      hasMore: data.length === limit,
+      nextOffset: offset + data.length,
+    };
+  } catch (error) {
+    console.error('Error listing files:', error);
+    throw error;
+  }
+}
+
+// Usage with pagination
+const filesPerPage = 50;
+let currentOffset = 0;
+let hasMore = true;
+
+async function loadMoreFiles() {
+  if (!hasMore) return;
+  
+  try {
+    const result = await listFiles('public', 'images/', {
+      limit: filesPerPage,
+      offset: currentOffset,
+      sortBy: { column: 'created_at', order: 'desc' },
+    });
+    
+    // Append files to your UI
+    displayFiles(result.files);
+    
+    // Update pagination state
+    currentOffset = result.nextOffset;
+    hasMore = result.hasMore;
+    
+    // Update load more button state
+    loadMoreButton.disabled = !hasMore;
+  } catch (error) {
+    console.error('Failed to load files:', error);
+  }
+}
+
+// Initial load
+loadMoreFiles();
+
+// Add event listener to load more button
+loadMoreButton.addEventListener('click', loadMoreFiles);
+```
+
+## Database Integration
+
+### File Metadata Table
+
+Create a database table to track file metadata:
+
+```sql
+CREATE TABLE public.file_metadata (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  bucket_id TEXT NOT NULL,
+  storage_path TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  mime_type TEXT NOT NULL,
+  original_name TEXT,
+  width INTEGER,
+  height INTEGER,
+  duration INTEGER,
+  owner_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+  is_public BOOLEAN DEFAULT false,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ,
+  metadata JSONB,
+  
+  UNIQUE(bucket_id, storage_path)
+);
+
+-- Add RLS policies
+ALTER TABLE public.file_metadata ENABLE ROW LEVEL SECURITY;
+
+-- Owner can do anything with their files
+CREATE POLICY "Owners can do anything with their files" ON public.file_metadata
+FOR ALL USING (owner_id = auth.uid());
+
+-- Public files can be viewed by anyone
+CREATE POLICY "Public files can be viewed by anyone" ON public.file_metadata
+FOR SELECT USING (is_public = true AND deleted_at IS NULL);
+
+-- Create indexes
+CREATE INDEX file_metadata_owner_id_idx ON public.file_metadata(owner_id);
+CREATE INDEX file_metadata_bucket_path_idx ON public.file_metadata(bucket_id, storage_path);
+CREATE INDEX file_metadata_public_idx ON public.file_metadata(is_public) WHERE is_public = true;
+```
+
+### Syncing Storage and Database
+
+Implement trigger functions to keep your database and storage in sync:
+
+```sql
+-- Function to delete files from storage when deleted from metadata
+CREATE OR REPLACE FUNCTION delete_storage_object()
+RETURNS TRIGGER AS $$
+DECLARE
+  storage_object RECORD;
+BEGIN
+  -- If this is a soft delete (deleted_at is set), don't remove from storage yet
+  IF NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL THEN
+    RETURN NEW;
+  END IF;
+  
+  -- Hard delete (row actually deleted)
+  IF TG_OP = 'DELETE' THEN
+    -- Query the storage.objects table
+    SELECT * INTO storage_object 
+    FROM storage.objects 
+    WHERE bucket_id = OLD.bucket_id 
+      AND name = OLD.storage_path;
+    
+    -- If the object exists in storage, delete it
+    IF storage_object.id IS NOT NULL THEN
+      DELETE FROM storage.objects 
+      WHERE bucket_id = OLD.bucket_id 
+        AND name = OLD.storage_path;
+    END IF;
+  END IF;
+  
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Trigger for hard deletes
+CREATE TRIGGER before_delete_file_metadata
+BEFORE DELETE ON public.file_metadata
+FOR EACH ROW EXECUTE FUNCTION delete_storage_object();
+```
+
+### File Sharing Implementation
+
+Create a table and functions for file sharing:
+
+```sql
+-- File sharing table
+CREATE TABLE public.file_shares (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  file_id UUID NOT NULL REFERENCES public.file_metadata(id) ON DELETE CASCADE,
+  shared_by UUID NOT NULL REFERENCES auth.users(id),
+  shared_with UUID REFERENCES auth.users(id),
+  email TEXT,
+  access_level TEXT NOT NULL CHECK (access_level IN ('view', 'edit')),
+  token TEXT UNIQUE,
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  
+  -- Ensure either shared_with or email is provided
+  CONSTRAINT share_target_check CHECK (
+    (shared_with IS NOT NULL AND email IS NULL) OR
+    (shared_with IS NULL AND email IS NOT NULL)
+  )
+);
+
+-- RLS policies
+ALTER TABLE public.file_shares ENABLE ROW LEVEL SECURITY;
+
+-- Users can see shares they created
+CREATE POLICY "Users can see shares they created" ON public.file_shares
+FOR SELECT USING (shared_by = auth.uid());
+
+-- Users can see shares they received
+CREATE POLICY "Users can see shares they received" ON public.file_shares
+FOR SELECT USING (shared_with = auth.uid());
+
+-- Users can create shares for files they own
+CREATE POLICY "Users can share their own files" ON public.file_shares
+FOR INSERT WITH CHECK (
+  EXISTS (
+    SELECT 1 FROM public.file_metadata
+    WHERE file_metadata.id = file_shares.file_id
+    AND file_metadata.owner_id = auth.uid()
+  )
+);
+
+-- Add a policy to storage.objects for shared files
+CREATE POLICY "Users can access files shared with them" ON storage.objects
+FOR SELECT USING (
+  EXISTS (
+    SELECT 1 FROM public.file_shares
+    JOIN public.file_metadata ON file_shares.file_id = file_metadata.id
+    WHERE file_metadata.bucket_id = storage.objects.bucket_id
+    AND file_metadata.storage_path = storage.objects.name
+    AND file_shares.shared_with = auth.uid()
+    AND (file_shares.expires_at IS NULL OR file_shares.expires_at > NOW())
+  )
+);
+```
+
+## Handling Image Assets
+
+### Image Processing
+
+Handle responsive images by creating multiple sizes on upload:
+
+```typescript
+// Edge Function to process images
+import { createClient } from '@supabase/supabase-js';
+import { processImage } from 'https://deno.land/x/imagetools@v1.0.0/mod.ts';
+
+// Initialize Supabase
+const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+// Define image sizes
+const IMAGE_SIZES = [
+  { width: 100, height: 100, suffix: 'thumbnail' },
+  { width: 800, height: 600, suffix: 'medium' },
+  { width: 1920, height: 1080, suffix: 'large' },
+];
+
+Deno.serve(async (req) => {
+  try {
+    // Get the uploaded file information from the request
+    const { file, userId, bucket } = await req.json();
+    
+    // For each size, create a resized version
+    const results = [];
+    
+    for (const size of IMAGE_SIZES) {
+      // Get the original file
+      const { data: fileData, error: fileError } = await supabase
+        .storage
+        .from(bucket)
+        .download(file.path);
+        
+      if (fileError) throw fileError;
+      
+      // Process the image (resize)
+      const processedImage = await processImage(fileData, {
+        width: size.width,
+        height: size.height,
+        fit: 'cover',
+        format: 'webp',
+        quality: 80,
+      });
+      
+      // Generate path for the resized image
+      const originalPath = file.path;
+      const fileNameParts = originalPath.split('.');
+      const extension = 'webp'; // We're converting to WebP
+      
+      // Remove original extension and add size suffix
+      const basePath = fileNameParts.slice(0, -1).join('.');
+      const newPath = `${basePath}_${size.suffix}.${extension}`;
+      
+      // Upload the resized image
+      const { data: uploadData, error: uploadError } = await supabase
+        .storage
+        .from(bucket)
+        .upload(newPath, processedImage, {
+          contentType: 'image/webp',
+          upsert: true,
+        });
+        
+        if (uploadError) throw uploadError;
+        
+        // Get the URL
+        const { data: urlData } = supabase
+          .storage
+          .from(bucket)
+          .getPublicUrl(newPath);
+          
+        // Add to results
+        results.push({
+          path: newPath,
+          url: urlData.publicUrl,
+          width: size.width,
+          height: size.height,
+          size: processedImage.length,
+        });
+    }
+    
+    // Store the image metadata in the database
+    const { data: metadataData, error: metadataError } = await supabase
+      .from('file_metadata')
+      .insert({
+        name: file.name,
+        bucket_id: bucket,
+        storage_path: file.path,
+        size: file.size,
+        mime_type: file.type,
+        owner_id: userId,
+        is_public: bucket === 'public',
+        metadata: {
+          variants: results,
+        },
+      })
+      .select();
+      
+    if (metadataError) throw metadataError;
+    
+    return new Response(
+      JSON.stringify({
+        success: true,
+        file: metadataData[0],
+        variants: results,
+      }),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('Error processing image:', error);
+    
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+});
+```
+
+### Image Component with srcset
+
+Create a responsive image component:
+
+```tsx
+// React component for responsive images
+import { useState, useEffect } from 'react';
+import { supabase } from '../lib/supabaseClient';
+
+interface ImageVariant {
+  path: string;
+  url: string;
+  width: number;
+  height: number;
+}
+
+interface ResponsiveImageProps {
+  fileId: string;
+  alt: string;
+  className?: string;
+  sizes?: string;
+}
+
+export default function ResponsiveImage({ fileId, alt, className, sizes = '100vw' }: ResponsiveImageProps) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [metadata, setMetadata] = useState<{
+    original: { url: string };
+    variants: ImageVariant[];
+  } | null>(null);
+
+  useEffect(() => {
+    async function loadImageMetadata() {
+      try {
+        setLoading(true);
+        
+        // Get the image metadata from the database
+        const { data, error } = await supabase
+          .from('file_metadata')
+          .select('*')
+          .eq('id', fileId)
+          .single();
+          
+        if (error) throw error;
+        
+        // Get the original image URL
+        const { data: urlData } = supabase
+          .storage
+          .from(data.bucket_id)
+          .getPublicUrl(data.storage_path);
+          
+        // Set the metadata
+        setMetadata({
+          original: { url: urlData.publicUrl },
+          variants: data.metadata?.variants || [],
+        });
+      } catch (err) {
+        console.error('Error loading image:', err);
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+    
+    loadImageMetadata();
+  }, [fileId]);
+  
+  if (loading) return <div className="image-placeholder"></div>;
+  if (error) return <div className="image-error">{error}</div>;
+  if (!metadata) return null;
+  
+  // Sort variants by width (smallest to largest)
+  const sortedVariants = [...metadata.variants].sort((a, b) => a.width - b.width);
+  
+  // Create srcset string
+  const srcset = sortedVariants.map(v => `${v.url} ${v.width}w`).join(', ');
+  
+  return (
+    <img
+      src={metadata.original.url}
+      srcSet={srcset}
+      sizes={sizes}
+      alt={alt}
+      className={className}
+      loading="lazy"
+    />
+  );
+}
+
+// Usage
+<ResponsiveImage
+  fileId="123e4567-e89b-12d3-a456-426614174000"
+  alt="Product image"
+  sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
+  className="rounded-lg shadow-md"
+/>
+```
+
+## Storage Migration and Backup
+
+### Backup Strategies
+
+```sql
+-- Create a scheduled function to backup important files
+CREATE OR REPLACE FUNCTION backup_important_files()
+RETURNS void AS $$
+DECLARE
+  file_record RECORD;
+  backup_path TEXT;
+  content BYTEA;
+BEGIN
+  -- Get all files that need backup
+  FOR file_record IN 
+    SELECT * FROM file_metadata 
+    WHERE (metadata->>'requires_backup')::boolean = true
+    AND (
+      metadata->>'last_backup_at' IS NULL 
+      OR (metadata->>'last_backup_at')::timestamptz < (NOW() - INTERVAL '1 day')
+    )
+  LOOP
+    -- Construct backup path
+    backup_path := 'backups/' || file_record.bucket_id || '/' || 
+                   TO_CHAR(NOW(), 'YYYY-MM-DD') || '/' || 
+                   file_record.storage_path;
+    
+    -- Copy the file to the backup bucket
+    -- This is a mock of the functionality - in real use, you would use
+    -- direct storage API calls in a function or use an Edge Function
+    PERFORM public.copy_storage_object(
+      file_record.bucket_id, 
+      file_record.storage_path,
+      'backups', 
+      backup_path
+    );
+    
+    -- Update the last backup time
+    UPDATE file_metadata
+    SET metadata = jsonb_set(
+      metadata,
+      '{last_backup_at}',
+      to_jsonb(NOW()::text)
+    )
+    WHERE id = file_record.id;
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Schedule the backup function
+SELECT cron.schedule(
+  'daily-file-backup',
+  '0 1 * * *',  -- Run at 1:00 AM every day
+  'SELECT backup_important_files()'
+);
+```
+
+### Migration Between Buckets
+
+```typescript
+// Edge Function to migrate files between buckets
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+Deno.serve(async (req) => {
+  try {
+    // Parse migration parameters from request
+    const { 
+      sourceBucket, 
+      sourcePrefix = '', 
+      targetBucket, 
+      targetPrefix = '',
+      moveFiles = false, // true = move, false = copy
+      updateMetadata = true,
+    } = await req.json();
+    
+    // List files to migrate
+    const { data: files, error: listError } = await supabase
+      .storage
+      .from(sourceBucket)
+      .list(sourcePrefix);
+      
+    if (listError) throw listError;
+    
+    const results = {
+      total: files.length,
+      successful: 0,
+      failed: 0,
+      errors: [],
+    };
+    
+    // Process each file
+    for (const file of files) {
+      try {
+        // Skip folders
+        if (file.id === null) continue;
+        
+        // Compute source and target paths
+        const sourcePath = sourcePrefix ? `${sourcePrefix}/${file.name}` : file.name;
+        const targetPath = targetPrefix ? `${targetPrefix}/${file.name}` : file.name;
+        
+        // Download the file
+        const { data: fileData, error: downloadError } = await supabase
+          .storage
+          .from(sourceBucket)
+          .download(sourcePath);
+          
+        if (downloadError) throw downloadError;
+        
+        // Upload to target bucket
+        const { data: uploadData, error: uploadError } = await supabase
+          .storage
+          .from(targetBucket)
+          .upload(targetPath, fileData, {
+            contentType: file.metadata?.mimetype || 'application/octet-stream',
+            upsert: true,
+          });
+          
+        if (uploadError) throw uploadError;
+        
+        // If it's a move operation, delete the source file
+        if (moveFiles) {
+          const { error: deleteError } = await supabase
+            .storage
+            .from(sourceBucket)
+            .remove([sourcePath]);
+            
+          if (deleteError) throw deleteError;
+        }
+        
+        // Update metadata in database if needed
+        if (updateMetadata) {
+          const { error: metadataError } = await supabase
+            .from('file_metadata')
+            .update({
+              bucket_id: targetBucket,
+              storage_path: targetPath,
+              updated_at: new Date(),
+            })
+            .match({
+              bucket_id: sourceBucket,
+              storage_path: sourcePath,
+            });
+            
+          if (metadataError) throw metadataError;
+        }
+        
+        results.successful++;
+      } catch (error) {
+        results.failed++;
+        results.errors.push({
+          file: file.name,
+          error: error.message,
+        });
+      }
+    }
+    
+    return new Response(
+      JSON.stringify(results),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('Migration error:', error);
+    
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+});
+```
+
+## Best Practices Summary
+
+1. **Organization**
+   - Use clear bucket naming conventions
+   - Implement consistent path structures
+   - Include user IDs in paths for user content
+
+2. **Security**
+   - Implement strict RLS policies
+   - Validate file types and sizes
+   - Use signed URLs for private content
+   - Consider using separate buckets based on access patterns
+
+3. **Performance**
+   - Use CDN caching for public assets
+   - Implement image resizing and optimization
+   - Use WebP format for images when possible
+   - Implement pagination for file listings
+
+4. **Reliability**
+   - Track file metadata in the database
+   - Implement backup strategies for important files
+   - Use transactions when updating both storage and database
+
+5. **User Experience**
+   - Show upload progress
+   - Implement preview functionality
+   - Use responsive images with srcset
+   - Handle offline uploads with background sync
+
+6. **Maintenance**
+   - Regularly remove temporary uploads
+   - Implement soft delete before hard delete
+   - Monitor storage usage and quotas
+   - Keep database metadata in sync with storage 

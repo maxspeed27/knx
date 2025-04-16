@@ -1,0 +1,308 @@
+---
+# Specify the following for Cursor rules
+description: Guidelines for writing Supabase database functions
+globs: "**/*function*.sql, **/functions/**/*.sql, **/supabase/functions/**/*.sql"
+---
+
+# Database: Create PostgreSQL Functions
+
+You're a Supabase PostgreSQL expert in developing database functions. Generate **high-quality PostgreSQL functions** that adhere to the following best practices and security standards:
+
+## Security Guidelines
+
+1. **Default to `SECURITY INVOKER`:**
+   - Functions should run with the permissions of the user invoking the function, ensuring safer access control.
+   - Use `SECURITY DEFINER` only when explicitly required and clearly document the rationale.
+   - When using `SECURITY DEFINER`, always limit the function's capabilities to only what is necessary.
+
+2. **Set the `search_path` Configuration Parameter:**
+   - Always set `search_path` to an empty string (`set search_path = '';`).
+   - This prevents "search path injection" attacks where malicious code might resolve object references to untrusted schemas.
+   - Use fully qualified names (e.g., `schema_name.table_name`) for all database objects referenced within the function.
+
+3. **Input Validation:**
+   - Always validate inputs to prevent SQL injection or unexpected behavior.
+   - Use appropriate type casting and error handling for inputs.
+
+## Performance Best Practices
+
+1. **Function Volatility:**
+   - Use the appropriate volatility label:
+     - `IMMUTABLE`: For functions that return the same result for the same input (e.g., math functions)
+     - `STABLE`: For functions that return the same result for the same input within a transaction (e.g., time-based calculations)
+     - `VOLATILE` (default): For functions that can modify the database or use random values
+   - More restrictive volatility settings enable better optimizer decisions.
+
+2. **Minimize Side Effects:**
+   - Prefer functions that return results rather than those that modify data unless they serve a specific purpose.
+   - Keep functions focused on a single task for better maintainability and reusability.
+
+3. **Use Efficient Processing:**
+   - Return early when possible.
+   - Avoid unnecessary computations.
+   - Consider using SQL language functions instead of PL/pgSQL for simple calculations.
+
+4. **Type Safety:**
+   - Always explicitly specify input and output types.
+   - Avoid dynamic SQL (`EXECUTE`) when possible, as it bypasses the query planner.
+   - If dynamic SQL is necessary, use parameter binding with `USING` rather than string concatenation.
+
+## Example Templates
+
+### Simple Function with `SECURITY INVOKER`
+
+```sql
+CREATE OR REPLACE FUNCTION public.calculate_price(product_id bigint)
+RETURNS numeric
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+DECLARE
+  base_price numeric;
+  tax_rate numeric;
+  final_price numeric;
+BEGIN
+  -- Validate input
+  IF product_id IS NULL OR product_id <= 0 THEN
+    RAISE EXCEPTION 'Invalid product_id: %', product_id;
+  END IF;
+  
+  -- Get base price
+  SELECT p.price, p.tax_category 
+  INTO base_price, tax_rate
+  FROM public.products p
+  WHERE p.id = product_id;
+  
+  IF base_price IS NULL THEN
+    RAISE EXCEPTION 'Product not found: %', product_id;
+  END IF;
+  
+  -- Calculate final price
+  final_price := base_price * (1 + tax_rate);
+  
+  RETURN final_price;
+END;
+$$;
+```
+
+### IMMUTABLE Function for Better Optimization
+
+```sql
+CREATE OR REPLACE FUNCTION public.full_name(first_name text, last_name text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+  SELECT COALESCE(first_name, '') || ' ' || COALESCE(last_name, '');
+$$;
+```
+
+### Row-Level Security Helper Function
+
+```sql
+CREATE OR REPLACE FUNCTION public.get_user_organizations()
+RETURNS SETOF bigint
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+  SELECT org_id 
+  FROM public.organization_members 
+  WHERE user_id = auth.uid();
+$$;
+
+-- Example usage in RLS policy:
+-- CREATE POLICY "Users can view data from their organizations"
+-- ON public.organization_data
+-- FOR SELECT
+-- TO authenticated
+-- USING (organization_id IN (SELECT public.get_user_organizations()));
+```
+
+### Trigger Function for Auditing
+
+```sql
+CREATE OR REPLACE FUNCTION public.audit_changes()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER -- Uses elevated permissions to write to audit table
+SET search_path = ''
+AS $$
+BEGIN
+  -- Insert into audit table
+  INSERT INTO public.audit_logs (
+    table_name,
+    operation,
+    record_id,
+    old_data,
+    new_data,
+    changed_by,
+    changed_at
+  ) VALUES (
+    TG_TABLE_NAME,
+    TG_OP,
+    CASE 
+      WHEN TG_OP = 'DELETE' THEN OLD.id 
+      ELSE NEW.id 
+    END,
+    CASE 
+      WHEN TG_OP = 'INSERT' THEN NULL 
+      ELSE to_jsonb(OLD) 
+    END,
+    CASE 
+      WHEN TG_OP = 'DELETE' THEN NULL 
+      ELSE to_jsonb(NEW) 
+    END,
+    (SELECT auth.uid()),
+    now()
+  );
+  
+  -- Return appropriate record
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  ELSE
+    RETURN NEW;
+  END IF;
+END;
+$$;
+
+-- Example trigger creation:
+CREATE TRIGGER audit_users_changes
+AFTER INSERT OR UPDATE OR DELETE ON public.users
+FOR EACH ROW EXECUTE FUNCTION public.audit_changes();
+```
+
+### Function with Error Handling and Transactions
+
+```sql
+CREATE OR REPLACE FUNCTION public.transfer_funds(
+  from_account_id bigint,
+  to_account_id bigint,
+  amount numeric
+) RETURNS boolean
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+DECLARE
+  from_balance numeric;
+  user_id uuid := auth.uid();
+BEGIN
+  -- Input validation
+  IF amount <= 0 THEN
+    RAISE EXCEPTION 'Transfer amount must be positive: %', amount;
+  END IF;
+  
+  IF from_account_id = to_account_id THEN
+    RAISE EXCEPTION 'Cannot transfer to the same account';
+  END IF;
+  
+  -- Check if user owns the from_account
+  PERFORM 1 FROM public.accounts 
+  WHERE id = from_account_id AND owner_id = user_id;
+  
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Not authorized to transfer from this account';
+  END IF;
+  
+  -- Begin transaction
+  BEGIN
+    -- Check sufficient funds
+    SELECT balance INTO from_balance
+    FROM public.accounts
+    WHERE id = from_account_id
+    FOR UPDATE; -- Lock row to prevent concurrent modifications
+    
+    IF from_balance < amount THEN
+      RAISE EXCEPTION 'Insufficient funds: % (required: %)', from_balance, amount;
+    END IF;
+    
+    -- Deduct from source account
+    UPDATE public.accounts
+    SET balance = balance - amount
+    WHERE id = from_account_id;
+    
+    -- Add to destination account
+    UPDATE public.accounts
+    SET balance = balance + amount
+    WHERE id = to_account_id;
+    
+    -- Create transfer record
+    INSERT INTO public.transfers (
+      from_account_id,
+      to_account_id,
+      amount,
+      created_by,
+      created_at
+    ) VALUES (
+      from_account_id,
+      to_account_id,
+      amount,
+      user_id,
+      now()
+    );
+    
+    RETURN true;
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- Any error will rollback the transaction
+      RAISE;
+  END;
+END;
+$$;
+```
+
+### Function Returning a Table
+
+```sql
+CREATE OR REPLACE FUNCTION public.search_products(
+  search_term text,
+  category_id bigint DEFAULT NULL,
+  min_price numeric DEFAULT NULL,
+  max_price numeric DEFAULT NULL,
+  limit_val int DEFAULT 50,
+  offset_val int DEFAULT 0
+)
+RETURNS TABLE (
+  id bigint,
+  name text,
+  description text,
+  price numeric,
+  category_name text,
+  average_rating numeric
+)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+  SELECT 
+    p.id,
+    p.name,
+    p.description,
+    p.price,
+    c.name as category_name,
+    COALESCE(AVG(r.rating), 0) as average_rating
+  FROM 
+    public.products p
+  LEFT JOIN 
+    public.categories c ON p.category_id = c.id
+  LEFT JOIN 
+    public.product_reviews r ON p.id = r.product_id
+  WHERE 
+    (search_term IS NULL OR p.name ILIKE '%' || search_term || '%' OR p.description ILIKE '%' || search_term || '%')
+    AND (category_id IS NULL OR p.category_id = category_id)
+    AND (min_price IS NULL OR p.price >= min_price)
+    AND (max_price IS NULL OR p.price <= max_price)
+  GROUP BY 
+    p.id, p.name, p.description, p.price, c.name
+  ORDER BY 
+    p.id
+  LIMIT limit_val
+  OFFSET offset_val;
+$$;
+``` 

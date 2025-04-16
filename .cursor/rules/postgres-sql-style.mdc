@@ -1,0 +1,178 @@
+---
+# Specify the following for Cursor rules
+description: Guidelines for writing Postgres SQL
+globs: "**/*.sql"
+---
+
+# Postgres SQL Style Guide
+
+## General
+
+- Use lowercase for SQL reserved words to maintain consistency and readability.
+- Employ consistent, descriptive identifiers for tables, columns, and other database objects.
+- Use white space and indentation to enhance the readability of your code.
+- Store dates in ISO 8601 format (`yyyy-mm-ddThh:mm:ss.sssss`).
+- Include comments for complex logic, using '/* ... */' for block comments and '--' for line comments.
+
+## Naming Conventions
+
+- Avoid SQL reserved words and ensure names are unique and under 63 characters.
+- Use snake_case for tables and columns.
+- Prefer plurals for table names (e.g., `users`, `products`, `orders`).
+- Prefer singular names for columns (e.g., `name`, `description`, `price`).
+- Foreign keys should follow the pattern `{singular_table_name}_id` (e.g., `user_id` for the `users` table).
+
+## Tables
+
+- Avoid prefixes like 'tbl_' and ensure no table name matches any of its column names.
+- Always add an `id` column of type `bigint generated always as identity primary key` unless otherwise specified.
+- Create all tables in the `public` schema unless otherwise specified.
+- Always add the schema to SQL queries for clarity.
+- Always add a comment to describe what the table does. The comment can be up to 1024 characters.
+- Always enable Row Level Security (RLS) on all tables, even for public access scenarios.
+- Consider adding `created_at` and `updated_at` timestamps to tables that will change over time.
+
+## Example Table Creation:
+
+```sql
+create table public.products (
+  id bigint generated always as identity primary key,
+  name text not null,
+  description text,
+  price numeric(10,2) not null,
+  category_id bigint references public.categories (id),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.products is 'Stores all product information in the e-commerce system';
+
+alter table public.products enable row level security;
+```
+
+## Queries
+
+- When the query is shorter keep it on just a few lines. As it gets larger start adding newlines for readability.
+- Add spaces for readability.
+- For performance, always consider indexing columns used in WHERE clauses and JOIN conditions.
+
+### Smaller queries:
+
+```sql
+select * from public.employees
+where end_date is null;
+
+update public.employees
+set end_date = '2023-12-31'
+where employee_id = 1001;
+```
+
+### Larger queries:
+
+```sql
+select
+  first_name,
+  last_name,
+  email,
+  department_name
+from
+  public.employees e
+join
+  public.departments d on e.department_id = d.id
+where
+  e.start_date between '2021-01-01' and '2021-12-31'
+  and e.status = 'active'
+order by
+  e.last_name,
+  e.first_name;
+```
+
+## Joins and Subqueries
+
+- Format joins and subqueries for clarity, aligning them with related SQL clauses.
+- Always use table aliases when joining multiple tables.
+- Prefer using the explicit JOIN syntax rather than comma-separated tables in the FROM clause.
+- Always use fully qualified column names (table.column) in JOINs to avoid ambiguity.
+
+```sql
+select
+  e.employee_name,
+  d.department_name,
+  p.project_name
+from
+  public.employees e
+join
+  public.departments d on e.department_id = d.id
+left join
+  public.projects p on e.project_id = p.id
+where
+  e.start_date > '2022-01-01';
+```
+
+## Aliases
+
+- Use meaningful aliases that reflect the data or transformation applied.
+- Always include the 'as' keyword for clarity with column aliases.
+- For table aliases, use short but intuitive names (e.g., 'e' for employees, 'p' for products).
+
+```sql
+select 
+  count(*) as total_employees,
+  avg(salary) as average_salary
+from 
+  public.employees e
+where 
+  e.end_date is null;
+```
+
+## Complex queries and CTEs
+
+- For complex queries, use Common Table Expressions (CTEs) to improve readability.
+- Structure CTEs to build logical blocks that can be easily understood.
+- Add comments to explain the purpose of each CTE and any complex transformations.
+- Prefer readability over performance optimizations unless performance is a specific concern.
+
+```sql
+with 
+  department_employees as (
+    -- Get all employees and their departments
+    select
+      e.department_id,
+      e.first_name,
+      e.last_name,
+      d.department_name
+    from
+      public.employees e
+    join
+      public.departments d on e.department_id = d.id
+    where
+      e.status = 'active'
+  ),
+  employee_counts as (
+    -- Count employees in each department
+    select
+      department_name,
+      count(*) as num_employees
+    from 
+      department_employees
+    group by
+      department_name
+  )
+select
+  department_name,
+  num_employees
+from
+  employee_counts
+order by
+  num_employees desc,
+  department_name;
+```
+
+## Performance Best Practices
+
+- Create appropriate indexes for columns used in WHERE clauses, JOINs, and ORDER BY statements.
+- Use EXPLAIN ANALYZE to evaluate query performance and identify bottlenecks.
+- Consider partitioning large tables based on access patterns.
+- Limit the use of SELECT * and specify only the columns you need.
+- For large data sets, use LIMIT and OFFSET or keyset pagination for improved performance.
+- Consider using materialized views for complex, frequently-accessed queries. 

@@ -1,0 +1,371 @@
+---
+description: Guidelines for integrating Supabase with React, React Router, Vite, and Cloudflare Workers.
+globs:
+ - "**/*supabase*.{ts,js,tsx,jsx}"
+  - "**/supabase/**/*.{ts,js,tsx,jsx}"
+  - "**/supabase.{ts,js}"
+  - "**/supabase-client.{ts,js}"
+alwaysApply: true
+---
+
+# Supabase Integration Guidelines
+
+This document provides best practices for integrating Supabase with React, React Router, Vite, and Cloudflare Workers.
+
+## Core Supabase Client Setup
+
+### Base Client Configuration
+
+```typescript
+// src/lib/supabase.ts
+import { createClient } from '@supabase/supabase-js'
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+// Standard client without auth
+export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+```
+
+### Environment Variables
+
+Always use environment variables for Supabase credentials:
+
+```
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key
+```
+
+For production, add service role key only when absolutely needed:
+
+```
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+```
+
+## Data Fetching Patterns
+
+### React Query Integration
+
+```typescript
+// src/hooks/use-supabase-query.ts
+import { useQuery } from '@tanstack/react-query'
+import { supabase } from '../lib/supabase'
+
+export function useSupabaseQuery(table, options = {}) {
+  return useQuery({
+    queryKey: [table, options],
+    queryFn: async () => {
+      let query = supabase.from(table).select('*')
+      
+      // Apply filters, limits, etc. from options
+      if (options.filter) {
+        query = query.eq(options.filter.column, options.filter.value)
+      }
+      
+      if (options.limit) {
+        query = query.limit(options.limit)
+      }
+      
+      const { data, error } = await query
+      
+      if (error) throw error
+      return data
+    }
+  })
+}
+```
+
+### Optimistic Updates
+
+```typescript
+// Example using React Query's mutations
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { supabase } from '../lib/supabase'
+
+export function useAddItem() {
+  const queryClient = useQueryClient()
+  
+  return useMutation({
+    mutationFn: async (newItem) => {
+      const { data, error } = await supabase
+        .from('items')
+        .insert(newItem)
+        .select()
+        .single()
+        
+      if (error) throw error
+      return data
+    },
+    onMutate: async (newItem) => {
+      // Cancel outgoing refetches
+      await queryClient.cancelQueries({ queryKey: ['items'] })
+      
+      // Snapshot the previous value
+      const previousItems = queryClient.getQueryData(['items'])
+      
+      // Optimistically update
+      queryClient.setQueryData(['items'], old => [...old, { ...newItem, id: 'temp-id' }])
+      
+      return { previousItems }
+    },
+    onError: (err, newItem, context) => {
+      // Rollback on error
+      queryClient.setQueryData(['items'], context.previousItems)
+    },
+    onSettled: () => {
+      // Refetch after error or success
+      queryClient.invalidateQueries({ queryKey: ['items'] })
+    },
+  })
+}
+```
+
+## Real-time Subscriptions
+
+Implement real-time updates using Supabase subscriptions:
+
+```typescript
+// src/hooks/use-supabase-subscription.ts
+import { useEffect, useState } from 'react'
+import { supabase } from '../lib/supabase'
+
+export function useSupabaseSubscription(table) {
+  const [data, setData] = useState([])
+  const [error, setError] = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    // Initial fetch
+    fetchData()
+
+    // Set up real-time subscription
+    const subscription = supabase
+      .channel(`public:${table}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table }, handleChange)
+      .subscribe()
+
+    // Cleanup subscription
+    return () => {
+      subscription.unsubscribe()
+    }
+  }, [table])
+
+  async function fetchData() {
+    try {
+      setLoading(true)
+      const { data, error } = await supabase.from(table).select('*')
+      
+      if (error) throw error
+      setData(data)
+    } catch (error) {
+      setError(error)
+      console.error(`Error fetching ${table}:`, error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function handleChange(payload) {
+    const { eventType, new: newRecord, old: oldRecord } = payload
+    
+    if (eventType === 'INSERT') {
+      setData(prev => [...prev, newRecord])
+    } else if (eventType === 'UPDATE') {
+      setData(prev => prev.map(item => item.id === newRecord.id ? newRecord : item))
+    } else if (eventType === 'DELETE') {
+      setData(prev => prev.filter(item => item.id !== oldRecord.id))
+    }
+  }
+
+  return { data, error, loading }
+}
+```
+
+## Error Handling
+
+Use consistent error handling patterns:
+
+```typescript
+// src/lib/error-handler.ts
+export function handleSupabaseError(error) {
+  if (error.code === 'PGRST116') {
+    return {
+      type: 'not_found',
+      message: 'The requested resource was not found'
+    }
+  }
+  
+  if (error.code === '23505') {
+    return {
+      type: 'duplicate',
+      message: 'A record with this information already exists'
+    }
+  }
+  
+  if (error.code === '42501') {
+    return {
+      type: 'permission',
+      message: 'You do not have permission to perform this action'
+    }
+  }
+  
+  console.error('Supabase error:', error)
+  
+  return {
+    type: 'unknown',
+    message: 'An unexpected error occurred'
+  }
+}
+```
+
+## Database Types Integration
+
+Generate and use Supabase types for type safety:
+
+```typescript
+// src/types/supabase.ts
+export type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | { [key: string]: Json | undefined }
+  | Json[]
+
+export interface Database {
+  public: {
+    Tables: {
+      items: {
+        Row: {
+          id: string
+          name: string
+          description: string | null
+          user_id: string
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          name: string
+          description?: string | null
+          user_id?: string
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          name?: string
+          description?: string | null
+          user_id?: string
+          created_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "items_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          }
+        ]
+      }
+      // Add other tables here
+    }
+    Views: {
+      // Add views here
+    }
+    Functions: {
+      // Add functions here
+    }
+    Enums: {
+      // Add enums here
+    }
+  }
+}
+```
+
+## Performance Optimization
+
+### Query Optimization
+
+1. Always specify only the columns you need:
+   ```typescript
+   // Good
+   const { data } = await supabase
+     .from('users')
+     .select('id, name, email')
+   
+   // Avoid
+   const { data } = await supabase
+     .from('users')
+     .select('*')
+   ```
+
+2. Use pagination for large datasets:
+   ```typescript
+   const { data } = await supabase
+     .from('logs')
+     .select('id, action, created_at')
+     .order('created_at', { ascending: false })
+     .range(0, 9) // First 10 items
+   ```
+
+3. Set reasonable query timeouts:
+   ```typescript
+   const { data } = await supabase
+     .from('users')
+     .select()
+     .abortSignal(AbortSignal.timeout(3000)) // 3 second timeout
+   ```
+
+## Security Best Practices
+
+1. Never expose service role keys in client code
+2. Use RLS policies for all tables
+3. Validate all user inputs before sending to Supabase
+4. Use parameterized queries to prevent SQL injection
+
+## Storage Integration
+
+```typescript
+// src/lib/storage.ts
+import { supabase } from './supabase'
+import { v4 as uuidv4 } from 'uuid'
+
+export async function uploadFile(file, bucket = 'public') {
+  try {
+    const fileExt = file.name.split('.').pop()
+    const filePath = `${uuidv4()}.${fileExt}`
+    
+    const { data, error } = await supabase
+      .storage
+      .from(bucket)
+      .upload(filePath, file, {
+        cacheControl: '3600',
+        upsert: false
+      })
+      
+    if (error) throw error
+    
+    const { data: urlData } = supabase
+      .storage
+      .from(bucket)
+      .getPublicUrl(filePath)
+      
+    return {
+      path: filePath,
+      url: urlData.publicUrl
+    }
+  } catch (error) {
+    console.error('Error uploading file:', error)
+    throw error
+  }
+}
+```
+
+## Migrating Between Environments
+
+When migrating data between development, staging, and production:
+
+1. Use Supabase's CLI for migrations and seed data
+2. Keep development data separate from production
+3. Use environment-specific buckets for storage
+4. Test migrations in staging before applying to production

@@ -1,0 +1,1050 @@
+---
+# Specify the following for Cursor rules
+description: Guidelines for writing Supabase Edge Functions
+globs: "**/supabase/functions/**/*.{ts,js}, **/edge-functions/**/*.{ts,js}"
+---
+
+# Supabase Edge Functions
+
+You are a TypeScript expert writing serverless functions for Supabase Edge Functions. Follow these guidelines to create secure, efficient, and maintainable Edge Functions.
+
+## Function Structure and Organization
+
+### File Organization
+
+- Place all edge functions in the `supabase/functions/` directory
+- Organize related functions in subdirectories
+- Each function should have its own directory with an `index.ts` file as the entry point
+- Shared code should be placed in a `_shared` directory
+- Example structure:
+  ```
+  supabase/
+  ├── functions/
+  │   ├── _shared/
+  │   │   ├── cors.ts
+  │   │   └── supabase-client.ts
+  │   ├── auth-webhook/
+  │   │   └── index.ts
+  │   ├── process-payment/
+  │   │   └── index.ts
+  │   └── get-user-data/
+  │       └── index.ts
+  ```
+
+### Function Template
+
+A basic Supabase Edge Function should follow this structure:
+
+```typescript
+import { corsHeaders } from '../_shared/cors.ts'
+import { createClient } from '@supabase/supabase-js'
+
+// Essential types for proper request/response handling
+interface RequestWithBody extends Request {
+  bodyParsed?: any;
+}
+
+// Deno serves using this handler
+Deno.serve(async (req: RequestWithBody) => {
+  // Handle preflight CORS requests
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders })
+  }
+
+  try {
+    // Parse and validate request
+    const { method, bodyParsed } = await parseRequest(req);
+    
+    // Validate authentication if needed
+    const supabase = createAuthenticatedClient(req);
+    
+    // Function-specific logic
+    const result = await processRequest(method, bodyParsed, supabase);
+    
+    // Return successful response
+    return new Response(
+      JSON.stringify(result),
+      {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: 200,
+      },
+    )
+  } catch (error) {
+    // Handle errors consistently
+    console.error('Error processing request:', error.message);
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: error.status || 500,
+      },
+    )
+  }
+})
+
+// Helper function to parse request body
+async function parseRequest(req: RequestWithBody) {
+  // Clone the request to avoid reading body twice
+  const clonedReq = req.clone();
+  const method = clonedReq.method;
+  
+  if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+    const contentType = clonedReq.headers.get('content-type') || '';
+    
+    if (contentType.includes('application/json')) {
+      req.bodyParsed = await clonedReq.json();
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
+      req.bodyParsed = Object.fromEntries(await clonedReq.formData());
+    } else if (contentType.includes('multipart/form-data')) {
+      req.bodyParsed = Object.fromEntries(await clonedReq.formData());
+    } else {
+      req.bodyParsed = await clonedReq.text();
+    }
+  }
+  
+  return { method, bodyParsed: req.bodyParsed };
+}
+
+// Helper function to create an authenticated Supabase client
+function createAuthenticatedClient(req: Request) {
+  // Get the client credentials from environment variables
+  const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+  const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+  
+  // Get the Authorization header for user context
+  const authHeader = req.headers.get('Authorization');
+
+  // Create a Supabase client with the service role key
+  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+  
+  // If we have an auth header, set it for the client (user context)
+  if (authHeader) {
+    supabase.auth.setAuth(authHeader.replace('Bearer ', ''));
+  }
+  
+  return supabase;
+}
+
+// Function-specific logic
+async function processRequest(method: string, body: any, supabase: any) {
+  switch (method) {
+    case 'GET':
+      // Handle GET request
+      return { message: 'GET request processed' };
+    case 'POST':
+      // Handle POST request
+      return { message: 'POST request processed' };
+    case 'PUT':
+      // Handle PUT request
+      return { message: 'PUT request processed' };
+    case 'DELETE':
+      // Handle DELETE request
+      return { message: 'DELETE request processed' };
+    default:
+      throw new Error('Method not allowed');
+  }
+}
+```
+
+## Security Best Practices
+
+### Authentication and Authorization
+
+1. **Verify JWT tokens** for authenticated requests:
+   ```typescript
+   // Verify JWT token
+   import { createClient } from '@supabase/supabase-js'
+
+   const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+   const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') ?? '';
+   
+   // Get the JWT token from the Authorization header
+   const authHeader = req.headers.get('Authorization');
+   if (!authHeader) {
+     return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+       status: 401,
+       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+     });
+   }
+   
+   const token = authHeader.replace('Bearer ', '');
+   
+   // Create a Supabase client with the anon key
+   const supabase = createClient(supabaseUrl, supabaseAnonKey);
+   
+   // Verify the token
+   const { data: { user }, error } = await supabase.auth.getUser(token);
+   
+   if (error || !user) {
+     return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+       status: 401,
+       headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+     });
+   }
+   ```
+
+2. **Use service role key with caution**:
+   - Only use the service role key when absolutely necessary
+   - Never expose it to the client-side
+   - Understand that using it bypasses RLS policies
+   
+   ```typescript
+   // Service role client (SERVER USE ONLY - bypasses RLS)
+   const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+   const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey);
+   ```
+
+3. **Implement CORS properly**:
+   Create a shared CORS utility in `_shared/cors.ts`:
+   
+   ```typescript
+   // _shared/cors.ts
+   
+   // Define allowed origins based on environment
+   const allowedOrigins = [
+     // Local development
+     'http://localhost:3000',
+     // Production
+     'https://yourdomain.com',
+   ];
+   
+   export const corsHeaders = {
+     'Access-Control-Allow-Origin': '*',  // Or use allowedOrigins to restrict
+     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+   };
+   
+   // Helper to validate origin
+   export function isValidOrigin(origin: string | null): boolean {
+     if (!origin) return false;
+     return allowedOrigins.includes(origin);
+   }
+   ```
+
+4. **Input validation** to prevent injection and other attacks:
+   ```typescript
+   import { z } from 'https://deno.land/x/zod@v3.21.4/mod.ts';
+   
+   // Define validation schema
+   const userSchema = z.object({
+     name: z.string().min(1).max(100),
+     email: z.string().email(),
+     age: z.number().int().positive().optional(),
+   });
+   
+   // Validate input
+   try {
+     const validatedData = userSchema.parse(req.bodyParsed);
+     // Process validated data
+   } catch (error) {
+     return new Response(
+       JSON.stringify({ error: 'Invalid input', details: error.errors }),
+       { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+     );
+   }
+   ```
+
+5. **Rate limiting** to prevent abuse:
+   ```typescript
+   // Simple in-memory rate limiting (for demo purposes)
+   // In production, use Redis or similar for distributed rate limiting
+   
+   const RATE_LIMIT = 10; // requests
+   const WINDOW_MS = 60 * 1000; // 1 minute
+   
+   const ipRequests = new Map<string, { count: number, resetAt: number }>();
+   
+   function isRateLimited(ip: string): boolean {
+     const now = Date.now();
+     const record = ipRequests.get(ip);
+     
+     if (!record || now > record.resetAt) {
+       // First request or window expired
+       ipRequests.set(ip, { count: 1, resetAt: now + WINDOW_MS });
+       return false;
+     }
+     
+     if (record.count >= RATE_LIMIT) {
+       return true; // Rate limited
+     }
+     
+     // Increment count
+     record.count += 1;
+     ipRequests.set(ip, record);
+     return false;
+   }
+   
+   // Usage
+   const clientIP = req.headers.get('x-forwarded-for') || 'unknown';
+   
+   if (isRateLimited(clientIP)) {
+     return new Response(
+       JSON.stringify({ error: 'Too many requests' }),
+       { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+     );
+   }
+   ```
+
+### Error Handling
+
+1. **Structured error handling** with proper status codes:
+   ```typescript
+   // Custom error class with status code
+   class APIError extends Error {
+     status: number;
+     
+     constructor(message: string, status = 500) {
+       super(message);
+       this.name = 'APIError';
+       this.status = status;
+     }
+   }
+   
+   // Usage
+   try {
+     // Function logic
+     if (!user) {
+       throw new APIError('User not found', 404);
+     }
+     
+     if (!isAuthorized) {
+       throw new APIError('Forbidden', 403);
+     }
+   } catch (error) {
+     const status = error instanceof APIError ? error.status : 500;
+     const message = error instanceof Error ? error.message : 'Unknown error';
+     
+     return new Response(
+       JSON.stringify({ error: message }),
+       { status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+     );
+   }
+   ```
+
+2. **Don't expose sensitive information** in error messages:
+   ```typescript
+   // Bad
+   try {
+     // Database query
+   } catch (error) {
+     return new Response(JSON.stringify({ error: error.message, stack: error.stack }), { status: 500 });
+   }
+   
+   // Good
+   try {
+     // Database query
+   } catch (error) {
+     console.error('Database error:', error); // Log full error internally
+     return new Response(JSON.stringify({ error: 'Database operation failed' }), { status: 500 });
+   }
+   ```
+
+## Performance Optimization
+
+1. **Minimize cold starts** by keeping functions focused:
+   - Split complex functions into smaller, focused ones
+   - Only import what you need
+   - Use dynamic imports for rarely used dependencies
+
+2. **Efficient database queries**:
+   ```typescript
+   // Bad: Multiple round trips
+   const { data: user } = await supabase.from('users').select('id, name').eq('id', userId).single();
+   const { data: posts } = await supabase.from('posts').select('id, title').eq('user_id', userId);
+   
+   // Good: Single query with joins
+   const { data: userData } = await supabase
+     .from('users')
+     .select(`
+       id, 
+       name,
+       posts:posts(id, title)
+     `)
+     .eq('id', userId)
+     .single();
+   ```
+
+3. **Caching for expensive operations**:
+   ```typescript
+   // Using Deno's cache API
+   const cacheKey = `data:${id}`;
+   
+   // Try to get from cache
+   const cached = await caches.default.match(cacheKey);
+   if (cached) {
+     return new Response(await cached.text(), {
+       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+     });
+   }
+   
+   // If not in cache, fetch data
+   const data = await fetchExpensiveData(id);
+   
+   // Store in cache for 5 minutes
+   const response = new Response(JSON.stringify(data), {
+     headers: { ...corsHeaders, 'Content-Type': 'application/json', 'Cache-Control': 'max-age=300' },
+   });
+   
+   await caches.default.put(cacheKey, response.clone());
+   
+   return response;
+   ```
+
+4. **Optimize response size**:
+   - Only return necessary data
+   - Consider pagination for large data sets
+   - Use compression when appropriate
+
+   ```typescript
+   // Pagination example
+   const { page = 1, pageSize = 10 } = Object.fromEntries(new URL(req.url).searchParams);
+   
+   const from = (Number(page) - 1) * Number(pageSize);
+   const to = from + Number(pageSize) - 1;
+   
+   const { data, count } = await supabase
+     .from('items')
+     .select('id, name, description', { count: 'exact' })
+     .range(from, to);
+     
+   return new Response(
+     JSON.stringify({
+       data,
+       pagination: {
+         total: count,
+         page: Number(page),
+         pageSize: Number(pageSize),
+         pageCount: Math.ceil(count / Number(pageSize)),
+       },
+     }),
+     { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+   );
+   ```
+
+## TypeScript Best Practices
+
+1. **Strong typing** for all functions and variables:
+   ```typescript
+   // Define clear interfaces
+   interface User {
+     id: string;
+     name: string;
+     email: string;
+     role: 'admin' | 'user';
+     metadata?: Record<string, unknown>;
+   }
+   
+   interface APIResponse<T> {
+     data: T | null;
+     error: string | null;
+     meta?: {
+       processingTime?: number;
+       version?: string;
+     };
+   }
+   
+   // Use generics for reusable functions
+   async function handleRequest<T>(
+     req: Request, 
+     processor: (body: any) => Promise<T>
+   ): Promise<APIResponse<T>> {
+     const startTime = performance.now();
+     
+     try {
+       const body = await req.json();
+       const data = await processor(body);
+       
+       return {
+         data,
+         error: null,
+         meta: {
+           processingTime: performance.now() - startTime,
+           version: '1.0',
+         },
+       };
+     } catch (error) {
+       return {
+         data: null,
+         error: error instanceof Error ? error.message : 'Unknown error',
+         meta: {
+           processingTime: performance.now() - startTime,
+           version: '1.0',
+         },
+       };
+     }
+   }
+   ```
+
+2. **Avoid `any` type** whenever possible:
+   ```typescript
+   // Bad
+   function processData(data: any): any {
+     return data.items.map((item: any) => item.name);
+   }
+   
+   // Good
+   interface Item {
+     id: string;
+     name: string;
+     value: number;
+   }
+   
+   interface ItemData {
+     items: Item[];
+     total: number;
+   }
+   
+   function processData(data: ItemData): string[] {
+     return data.items.map((item) => item.name);
+   }
+   ```
+
+3. **Use TypeScript utility types** for advanced type operations:
+   ```typescript
+   // Pick only certain properties
+   type UserSummary = Pick<User, 'id' | 'name' | 'role'>;
+   
+   // Make some properties optional
+   type UpdateableUser = Partial<User>;
+   
+   // Make properties required
+   type RequiredUserData = Required<Pick<User, 'name' | 'email'>>;
+   
+   // Exclude certain properties
+   type UserWithoutMetadata = Omit<User, 'metadata'>;
+   ```
+
+## Testing Edge Functions
+
+1. **Local testing** with Supabase CLI:
+   ```bash
+   # Start the local Supabase stack
+   supabase start
+   
+   # Serve edge functions locally
+   supabase functions serve
+   
+   # Test with curl or another HTTP client
+   curl -X POST http://localhost:54321/functions/v1/my-function \
+     -H "Authorization: Bearer [JWT]" \
+     -H "Content-Type: application/json" \
+     -d '{"key": "value"}'
+   ```
+
+2. **Unit testing** using Deno's test framework:
+   Create a test file named `index.test.ts` in your function directory:
+   
+   ```typescript
+   // index.test.ts
+   
+   import { assertEquals } from 'https://deno.land/std@0.170.0/testing/asserts.ts';
+   import { processRequest } from './index.ts';
+   
+   // Mock Supabase client
+   const mockSupabase = {
+     from: (table: string) => ({
+       select: (query: string) => ({
+         eq: (column: string, value: any) => ({
+           single: () => Promise.resolve({
+             data: { id: '1', name: 'Test User' },
+             error: null,
+           }),
+         }),
+       }),
+     }),
+   };
+   
+   Deno.test('processRequest - GET', async () => {
+     const result = await processRequest('GET', {}, mockSupabase);
+     assertEquals(result.message, 'GET request processed');
+   });
+   
+   Deno.test('processRequest - POST', async () => {
+     const result = await processRequest('POST', { name: 'Test' }, mockSupabase);
+     assertEquals(result.message, 'POST request processed');
+   });
+   
+   // Run with: deno test index.test.ts
+   ```
+
+3. **Integration testing** with real backend:
+   - Create a staging environment for testing
+   - Use separate database for integration tests
+   - Create test data fixture
+
+## Real-World Examples
+
+### User Authentication Webhook (Integrating with External Auth Providers)
+
+```typescript
+// supabase/functions/auth-webhook/index.ts
+
+import { corsHeaders } from '../_shared/cors.ts';
+import { createClient } from '@supabase/supabase-js';
+
+// Environment variables
+const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+const webhookSecret = Deno.env.get('AUTH_WEBHOOK_SECRET') ?? '';
+
+// Create Supabase admin client (bypasses RLS)
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+// Define authentication provider type
+type AuthProvider = 'clerk' | 'auth0' | 'firebase';
+
+// Define user data structure
+interface UserData {
+  id: string;
+  email: string;
+  name?: string;
+  picture?: string;
+  provider: AuthProvider;
+  provider_id: string;
+  metadata?: Record<string, unknown>;
+}
+
+Deno.serve(async (req) => {
+  // Handle CORS
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+  
+  try {
+    // Verify webhook secret
+    const authHeader = req.headers.get('Authorization');
+    if (!authHeader || authHeader !== `Bearer ${webhookSecret}`) {
+      return new Response(
+        JSON.stringify({ error: 'Unauthorized' }),
+        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Get and validate payload
+    const payload = await req.json();
+    
+    // Clerk webhook payload structure
+    // Adapt for your auth provider
+    const userData: UserData = {
+      id: payload.data.id,
+      email: payload.data.email_addresses[0]?.email_address,
+      name: payload.data.first_name ? `${payload.data.first_name} ${payload.data.last_name || ''}`.trim() : undefined,
+      picture: payload.data.profile_image_url,
+      provider: 'clerk',
+      provider_id: payload.data.id,
+      metadata: {
+        clerk_data: payload.data,
+      },
+    };
+    
+    // Process based on event type
+    switch (payload.type) {
+      case 'user.created':
+      case 'user.updated':
+        await upsertUser(userData);
+        break;
+      case 'user.deleted':
+        await deleteUser(userData.provider_id);
+        break;
+      default:
+        throw new Error(`Unsupported webhook event: ${payload.type}`);
+    }
+    
+    return new Response(
+      JSON.stringify({ success: true }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('Webhook error:', error);
+    
+    return new Response(
+      JSON.stringify({ error: 'Internal server error' }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+});
+
+// Helper function to create or update user
+async function upsertUser(userData: UserData) {
+  // First check if user exists
+  const { data: existingUser } = await supabase
+    .from('users')
+    .select('id')
+    .eq('provider', userData.provider)
+    .eq('provider_id', userData.provider_id)
+    .maybeSingle();
+  
+  if (existingUser) {
+    // Update existing user
+    return supabase
+      .from('users')
+      .update({
+        email: userData.email,
+        name: userData.name,
+        avatar_url: userData.picture,
+        updated_at: new Date().toISOString(),
+        metadata: userData.metadata,
+      })
+      .eq('id', existingUser.id);
+  } else {
+    // Create new user
+    return supabase
+      .from('users')
+      .insert({
+        email: userData.email,
+        name: userData.name,
+        avatar_url: userData.picture,
+        provider: userData.provider,
+        provider_id: userData.provider_id,
+        metadata: userData.metadata,
+      });
+  }
+}
+
+// Helper function to delete user
+async function deleteUser(providerId: string) {
+  return supabase
+    .from('users')
+    .delete()
+    .match({ provider_id: providerId });
+}
+```
+
+### Handling File Uploads to Storage
+
+```typescript
+// supabase/functions/upload-image/index.ts
+
+import { corsHeaders } from '../_shared/cors.ts';
+import { createClient } from '@supabase/supabase-js';
+import { v4 as uuidv4 } from 'https://deno.land/std@0.170.0/uuid/mod.ts';
+
+// Environment variables
+const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+
+// Create Supabase client with service role (for storage access)
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+// Allowed file types
+const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+Deno.serve(async (req) => {
+  // Handle CORS
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+  
+  try {
+    // Verify auth
+    const token = req.headers.get('Authorization')?.replace('Bearer ', '');
+    if (!token) {
+      return new Response(
+        JSON.stringify({ error: 'Unauthorized' }),
+        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Verify user with token
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) {
+      return new Response(
+        JSON.stringify({ error: 'Unauthorized' }),
+        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Only handle POST requests for uploads
+    if (req.method !== 'POST') {
+      return new Response(
+        JSON.stringify({ error: 'Method not allowed' }),
+        { status: 405, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Parse multipart form data
+    const formData = await req.formData();
+    const file = formData.get('file');
+    
+    // Validate file
+    if (!file || !(file instanceof File)) {
+      return new Response(
+        JSON.stringify({ error: 'No file provided' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Check file type
+    if (!ALLOWED_TYPES.includes(file.type)) {
+      return new Response(
+        JSON.stringify({ error: 'Invalid file type. Allowed types: JPEG, PNG, WebP' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Check file size
+    if (file.size > MAX_FILE_SIZE) {
+      return new Response(
+        JSON.stringify({ error: 'File too large (max 10MB)' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Generate unique filename
+    const fileExt = file.name.split('.').pop();
+    const fileName = `${uuidv4()}.${fileExt}`;
+    const filePath = `${user.id}/${fileName}`;
+    
+    // Upload to Supabase Storage
+    const { data, error } = await supabase.storage
+      .from('uploads')
+      .upload(filePath, file, {
+        contentType: file.type,
+        upsert: false,
+      });
+    
+    if (error) {
+      console.error('Storage upload error:', error);
+      return new Response(
+        JSON.stringify({ error: 'Failed to upload file' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Get public URL for the uploaded file
+    const { data: { publicUrl } } = supabase.storage
+      .from('uploads')
+      .getPublicUrl(filePath);
+    
+    // Record file upload in database (optional)
+    await supabase
+      .from('user_files')
+      .insert({
+        user_id: user.id,
+        file_path: filePath,
+        file_name: file.name,
+        file_type: file.type,
+        file_size: file.size,
+        public_url: publicUrl,
+      });
+    
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: {
+          path: filePath,
+          url: publicUrl,
+        },
+      }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('Upload error:', error);
+    
+    return new Response(
+      JSON.stringify({ error: 'Internal server error' }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+});
+```
+
+### Creating a Webhook for External API Integration
+
+```typescript
+// supabase/functions/stripe-webhook/index.ts
+
+import Stripe from 'https://esm.sh/stripe@12.0.0?target=deno';
+import { corsHeaders } from '../_shared/cors.ts';
+import { createClient } from '@supabase/supabase-js';
+
+// Environment variables
+const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+const stripeSecretKey = Deno.env.get('STRIPE_SECRET_KEY') ?? '';
+const stripeWebhookSecret = Deno.env.get('STRIPE_WEBHOOK_SECRET') ?? '';
+
+// Initialize Stripe
+const stripe = new Stripe(stripeSecretKey, {
+  apiVersion: '2023-10-16',
+  httpClient: Stripe.createFetchHttpClient(),
+});
+
+// Create Supabase admin client
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+Deno.serve(async (req) => {
+  // Handle CORS
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+  
+  try {
+    // Get the signature from headers
+    const signature = req.headers.get('stripe-signature');
+    
+    if (!signature) {
+      return new Response(
+        JSON.stringify({ error: 'Missing Stripe signature' }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Get raw body for verification
+    const body = await req.text();
+    
+    // Verify the event came from Stripe
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        body,
+        signature,
+        stripeWebhookSecret
+      );
+    } catch (err) {
+      return new Response(
+        JSON.stringify({ error: `Webhook signature verification failed: ${err.message}` }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    // Handle specific Stripe events
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        
+        // Get customer details
+        const customerId = session.customer;
+        const customerEmail = session.customer_details.email;
+        
+        // Get the metadata from the session
+        const { userId } = session.metadata ?? {};
+        
+        if (!userId) {
+          throw new Error('User ID not found in session metadata');
+        }
+        
+        // Update user subscription status in database
+        await supabase
+          .from('subscriptions')
+          .upsert({
+            user_id: userId,
+            stripe_customer_id: customerId,
+            stripe_subscription_id: session.subscription,
+            status: 'active',
+            price_id: session.line_items?.data[0]?.price?.id,
+            quantity: session.line_items?.data[0]?.quantity ?? 1,
+            cancel_at_period_end: false,
+            current_period_end: new Date(
+              session.subscription_data?.trial_end * 1000 ?? 
+              Date.now() + 30 * 24 * 60 * 60 * 1000
+            ).toISOString(),
+            current_period_start: new Date().toISOString(),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          }, {
+            onConflict: 'user_id',
+          });
+        
+        // Update user role if needed
+        await supabase
+          .from('users')
+          .update({
+            role: 'premium',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', userId);
+        
+        break;
+      }
+      
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object;
+        const customerId = subscription.customer;
+        
+        // Get user from Stripe customer ID
+        const { data: user } = await supabase
+          .from('subscriptions')
+          .select('user_id')
+          .eq('stripe_customer_id', customerId)
+          .single();
+        
+        if (!user) {
+          throw new Error(`No user found for Stripe customer ${customerId}`);
+        }
+        
+        // Update subscription status
+        await supabase
+          .from('subscriptions')
+          .update({
+            status: subscription.status,
+            price_id: subscription.items.data[0].price.id,
+            quantity: subscription.items.data[0].quantity,
+            cancel_at_period_end: subscription.cancel_at_period_end,
+            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq('stripe_customer_id', customerId);
+        
+        break;
+      }
+      
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object;
+        const customerId = subscription.customer;
+        
+        // Get user from Stripe customer ID
+        const { data: user } = await supabase
+          .from('subscriptions')
+          .select('user_id')
+          .eq('stripe_customer_id', customerId)
+          .single();
+        
+        if (!user) {
+          throw new Error(`No user found for Stripe customer ${customerId}`);
+        }
+        
+        // Update subscription status
+        await supabase
+          .from('subscriptions')
+          .update({
+            status: 'canceled',
+            cancel_at_period_end: false,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('stripe_customer_id', customerId);
+        
+        // Downgrade user role
+        await supabase
+          .from('users')
+          .update({
+            role: 'free',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', user.user_id);
+        
+        break;
+      }
+      
+      // Handle other webhook events as needed
+      
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+    
+    return new Response(
+      JSON.stringify({ received: true }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  } catch (error) {
+    console.error('Webhook error:', error);
+    
+    return new Response(
+      JSON.stringify({ error: 'Internal server error' }),
+      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+});
+``` 

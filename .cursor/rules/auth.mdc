@@ -1,0 +1,851 @@
+---
+description: Guidelines for Supabase Auth with Clerk integration
+globs: "**/*auth*.{ts,js,tsx,jsx}, **/*clerk*.{ts,js,tsx,jsx}, **/auth/**/*.{ts,js,tsx,jsx}"
+alwaysApply: false
+---
+
+# Supabase Authentication with Clerk
+
+This guide provides best practices for integrating Clerk authentication with Supabase in a React, React Router, Vite, and Cloudflare Workers environment.
+
+## Integration Overview
+
+Clerk provides the authentication layer while Supabase provides database access with Row Level Security (RLS) policies. Clerk generates valid Supabase JWT tokens that allow authenticated users to access data according to your RLS policies.
+
+> **Important:** The Clerk Supabase JWT template is being deprecated on April 1, 2025. The native integration is now the recommended approach for integrating Clerk with Supabase.
+
+## Database Configuration for Clerk Auth
+
+### 1. Create a User ID Function
+
+Create a function to extract the Clerk user ID from the JWT:
+
+```sql
+-- Function to extract Clerk user ID from JWT claims
+CREATE OR REPLACE FUNCTION requesting_user_id()
+RETURNS text
+LANGUAGE sql
+AS $$
+SELECT NULLIF(
+  current_setting('request.jwt.claims', true)::json->>'sub',
+  ''
+)::text;
+$$;
+```
+
+### 2. Add User ID Columns to Tables
+
+For tables that need user-specific access control:
+
+```sql
+-- Add user_id column to a table (repeat for each protected table)
+ALTER TABLE public.your_table
+ADD COLUMN user_id TEXT DEFAULT requesting_user_id();
+
+-- Add an index for the user_id column for better performance
+CREATE INDEX idx_your_table_user_id ON public.your_table(user_id);
+```
+
+### 3. Enable Row Level Security (RLS)
+
+Enable RLS on your tables and create policies:
+
+```sql
+-- Enable RLS
+ALTER TABLE public.your_table ENABLE ROW LEVEL SECURITY;
+
+-- Create policy for SELECT
+CREATE POLICY "Users can select their own data"
+ON public.your_table
+FOR SELECT
+TO authenticated
+USING (requesting_user_id() = user_id);
+
+-- Create policy for INSERT
+CREATE POLICY "Users can insert their own data"
+ON public.your_table
+FOR INSERT
+TO authenticated
+WITH CHECK (requesting_user_id() = user_id);
+
+-- Create policy for UPDATE
+CREATE POLICY "Users can update their own data"
+ON public.your_table
+FOR UPDATE
+TO authenticated
+USING (requesting_user_id() = user_id)
+WITH CHECK (requesting_user_id() = user_id);
+
+-- Create policy for DELETE
+CREATE POLICY "Users can delete their own data"
+ON public.your_table
+FOR DELETE
+TO authenticated
+USING (requesting_user_id() = user_id);
+```
+
+## Clerk Setup
+
+### 1. Create a Supabase JWT Template
+
+In the Clerk Dashboard:
+
+1. Navigate to **JWT Templates**
+2. Click **New template** and select **Supabase**
+3. Name your template (e.g., `supabase`)
+4. Add your Supabase JWT secret key (from Supabase Dashboard → Project Settings → API → JWT Settings)
+5. Save the template
+
+### 2. Configure Clerk in Your React Application
+
+Install Clerk dependencies:
+
+```bash
+npm install @clerk/clerk-react
+```
+
+Create a `.env` file with your Clerk API keys:
+
+```
+VITE_CLERK_PUBLISHABLE_KEY=pk_test_...
+VITE_CLERK_SECRET_KEY=sk_test_...
+```
+
+### 3. Setup Clerk Provider in Your Application
+
+```tsx
+// src/main.tsx
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { ClerkProvider } from '@clerk/clerk-react'
+import { BrowserRouter } from 'react-router-dom'
+import App from './App'
+import './index.css'
+
+const clerkPubKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <ClerkProvider publishableKey={clerkPubKey}>
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
+    </ClerkProvider>
+  </React.StrictMode>,
+)
+```
+
+## Supabase Integration
+
+### 1. Create a Custom Supabase Client
+
+Create a utility that generates a Supabase client with Clerk authentication:
+
+```tsx
+// src/lib/supabase.ts
+import { createClient } from '@supabase/supabase-js'
+import { useAuth } from '@clerk/clerk-react'
+import { useState, useEffect } from 'react'
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+// Standard client without auth
+export const supabase = createClient(supabaseUrl, supabaseAnonKey)
+
+// Hook to get an authenticated Supabase client
+export function useSupabaseClient() {
+  const { getToken } = useAuth()
+  const [client, setClient] = useState(supabase)
+
+  useEffect(() => {
+    const createAuthClient = async () => {
+      // Get the Supabase JWT from Clerk
+      const token = await getToken({ template: 'supabase' })
+      
+      // Create a new Supabase client with the token
+      const authClient = createClient(supabaseUrl, supabaseAnonKey, {
+        global: {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      })
+      
+      setClient(authClient)
+    }
+
+    createAuthClient()
+  }, [getToken])
+
+  return client
+}
+```
+
+### 2. Using the Authenticated Client in Components
+
+```tsx
+// src/components/ProtectedData.tsx
+import { useState, useEffect } from 'react'
+import { useSupabaseClient } from '../lib/supabase'
+
+interface Item {
+  id: number
+  name: string
+  user_id: string
+}
+
+export function ProtectedData() {
+  const [items, setItems] = useState<Item[]>([])
+  const [loading, setLoading] = useState(true)
+  const supabase = useSupabaseClient()
+
+  useEffect(() => {
+    async function fetchItems() {
+      try {
+        setLoading(true)
+        const { data, error } = await supabase
+          .from('items')
+          .select('*')
+        
+        if (error) throw error
+        setItems(data || [])
+      } catch (error) {
+        console.error('Error fetching items:', error)
+      } finally {
+        setLoading(false)
+      }
+    }
+
+    fetchItems()
+  }, [supabase])
+
+  return (
+    <div>
+      <h2>Your Items</h2>
+      {loading ? (
+        <p>Loading...</p>
+      ) : (
+        <ul>
+          {items.map(item => (
+            <li key={item.id}>{item.name}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+```
+
+## Cloudflare Workers Integration
+
+### 1. Configure Vite for Cloudflare Workers
+
+Install the Cloudflare Workers plugin for Vite:
+
+```bash
+npm install -D vite-plugin-cloudflare
+```
+
+Update your `vite.config.ts`:
+
+```ts
+// vite.config.ts
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import { cloudflare } from 'vite-plugin-cloudflare'
+
+export default defineConfig({
+  plugins: [
+    react(),
+    cloudflare({
+      wrangler: {
+        // Wrangler configuration options
+      }
+    })
+  ],
+  define: {
+    // Define process.env for compatibility
+    'process.env': process.env
+  }
+})
+```
+
+### 2. Create a Worker for Auth Validation
+
+```ts
+// src/worker.ts
+export interface Env {
+  SUPABASE_URL: string
+  SUPABASE_ANON_KEY: string
+  CLERK_SECRET_KEY: string
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // Handle CORS preflight requests
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+        }
+      })
+    }
+
+    // Extract the token from the Authorization header
+    const authHeader = request.headers.get('Authorization')
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    }
+
+    const token = authHeader.split(' ')[1]
+
+    try {
+      // Validate the token with Clerk API
+      const clerkResponse = await fetch('https://api.clerk.dev/v1/sessions/verify', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.CLERK_SECRET_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ token })
+      })
+
+      if (!clerkResponse.ok) {
+        return new Response(JSON.stringify({ error: 'Invalid token' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      }
+
+      const userData = await clerkResponse.json()
+
+      // Process the request with validated user data
+      // This is where you'd implement your API logic
+
+      return new Response(JSON.stringify({
+        message: 'Authenticated successfully',
+        userId: userData.sub
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      })
+    } catch (error) {
+      return new Response(JSON.stringify({ error: 'Authentication error' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    }
+  }
+}
+```
+
+## Protected Routes with React Router
+
+```tsx
+// src/components/ProtectedRoute.tsx
+import { Navigate } from 'react-router-dom'
+import { useAuth } from '@clerk/clerk-react'
+
+interface ProtectedRouteProps {
+  children: React.ReactNode
+}
+
+export function ProtectedRoute({ children }: ProtectedRouteProps) {
+  const { isSignedIn, isLoaded } = useAuth()
+
+  if (!isLoaded) {
+    return <div>Loading...</div>
+  }
+
+  if (!isSignedIn) {
+    return <Navigate to="/sign-in" replace />
+  }
+
+  return <>{children}</>
+}
+```
+
+Set up your routes:
+
+```tsx
+// src/App.tsx
+import { Routes, Route } from 'react-router-dom'
+import { 
+  SignIn, 
+  SignUp, 
+  UserProfile 
+} from '@clerk/clerk-react'
+import { ProtectedRoute } from './components/ProtectedRoute'
+import { ProtectedData } from './components/ProtectedData'
+import Home from './pages/Home'
+
+function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Home />} />
+      <Route path="/sign-in/*" element={<SignIn routing="path" path="/sign-in" />} />
+      <Route path="/sign-up/*" element={<SignUp routing="path" path="/sign-up" />} />
+      <Route 
+        path="/profile" 
+        element={
+          <ProtectedRoute>
+            <UserProfile />
+          </ProtectedRoute>
+        } 
+      />
+      <Route 
+        path="/dashboard" 
+        element={
+          <ProtectedRoute>
+            <ProtectedData />
+          </ProtectedRoute>
+        } 
+      />
+    </Routes>
+  )
+}
+
+export default App
+```
+
+## Supabase Storage Integration with Clerk Auth
+
+### 1. Create Storage Buckets with Appropriate RLS Policies
+
+```sql
+-- Create a private bucket for user files
+INSERT INTO storage.buckets (id, name) 
+VALUES ('private', 'private');
+
+-- Apply RLS policies for the private bucket
+CREATE POLICY "Users can access their own files" ON storage.objects
+FOR SELECT
+TO authenticated
+USING (
+  bucket_id = 'private' 
+  AND (storage.foldername(name))[1] = requesting_user_id()
+);
+
+CREATE POLICY "Users can upload their own files" ON storage.objects
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  bucket_id = 'private' 
+  AND (storage.foldername(name))[1] = requesting_user_id()
+);
+
+CREATE POLICY "Users can update their own files" ON storage.objects
+FOR UPDATE
+TO authenticated
+USING (
+  bucket_id = 'private' 
+  AND (storage.foldername(name))[1] = requesting_user_id()
+);
+
+CREATE POLICY "Users can delete their own files" ON storage.objects
+FOR DELETE
+TO authenticated
+USING (
+  bucket_id = 'private' 
+  AND (storage.foldername(name))[1] = requesting_user_id()
+);
+```
+
+### 2. Create a File Upload Component
+
+```tsx
+// src/components/FileUpload.tsx
+import { useState } from 'react'
+import { useUser } from '@clerk/clerk-react'
+import { useSupabaseClient } from '../lib/supabase'
+import { v4 as uuidv4 } from 'uuid'
+
+export function FileUpload() {
+  const { user } = useUser()
+  const supabase = useSupabaseClient()
+  const [uploading, setUploading] = useState(false)
+  const [file, setFile] = useState<File | null>(null)
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      setFile(e.target.files[0])
+    }
+  }
+
+  const handleUpload = async () => {
+    if (!file || !user) return
+    
+    try {
+      setUploading(true)
+      
+      // Create a unique file path with the user's ID as the first folder
+      const filePath = `${user.id}/${uuidv4()}-${file.name}`
+      
+      // Upload the file to Supabase Storage
+      const { data, error } = await supabase
+        .storage
+        .from('private')
+        .upload(filePath, file, {
+          cacheControl: '3600',
+          upsert: false
+        })
+        
+      if (error) throw error
+      
+      alert('File uploaded successfully!')
+      
+      // Optionally, store file metadata in a database table
+      await supabase
+        .from('files')
+        .insert({
+          name: file.name,
+          size: file.size,
+          type: file.type,
+          path: filePath,
+          created_at: new Date()
+        })
+      
+    } catch (error) {
+      console.error('Error uploading file:', error)
+      alert('Error uploading file')
+    } finally {
+      setUploading(false)
+      setFile(null)
+    }
+  }
+
+  return (
+    <div>
+      <h2>Upload File</h2>
+      <input 
+        type="file" 
+        onChange={handleFileChange} 
+        disabled={uploading} 
+      />
+      <button 
+        onClick={handleUpload} 
+        disabled={!file || uploading}
+      >
+        {uploading ? 'Uploading...' : 'Upload'}
+      </button>
+    </div>
+  )
+}
+```
+
+## Multi-tenancy with Clerk Organizations and Supabase
+
+For B2B SaaS applications, you can implement multi-tenancy using Clerk Organizations:
+
+### 1. Configure Database for Organizations
+
+```sql
+-- Organizations table
+CREATE TABLE public.organizations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  clerk_org_id TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Organization memberships
+CREATE TABLE public.organization_members (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(organization_id, user_id)
+);
+
+-- Organization data (example for multi-tenant data)
+CREATE TABLE public.organization_data (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organization_id UUID NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT,
+  created_by TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Enable RLS
+ALTER TABLE public.organizations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.organization_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.organization_data ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policies
+CREATE POLICY "Users can view organizations they belong to" ON public.organizations
+FOR SELECT
+TO authenticated
+USING (
+  clerk_org_id IN (
+    SELECT clerk_org_id FROM public.organizations
+    JOIN public.organization_members ON organizations.id = organization_members.organization_id
+    WHERE organization_members.user_id = requesting_user_id()
+  )
+);
+
+CREATE POLICY "Users can view organization data they have access to" ON public.organization_data
+FOR SELECT
+TO authenticated
+USING (
+  organization_id IN (
+    SELECT organization_id FROM public.organization_members
+    WHERE user_id = requesting_user_id()
+  )
+);
+
+CREATE POLICY "Users can create organization data they have access to" ON public.organization_data
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  organization_id IN (
+    SELECT organization_id FROM public.organization_members
+    WHERE user_id = requesting_user_id()
+    AND role = 'admin'
+  )
+);
+```
+
+### 2. Sync Clerk Organizations with Supabase
+
+Create an Edge Function to handle Clerk webhooks for organization events:
+
+```typescript
+// supabase/functions/clerk-org-webhook/index.ts
+import { createClient } from '@supabase/supabase-js'
+
+// Initialize Supabase client
+const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
+const supabaseServiceRole = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+const webhookSecret = Deno.env.get('CLERK_WEBHOOK_SECRET') ?? ''
+
+const supabase = createClient(supabaseUrl, supabaseServiceRole)
+
+Deno.serve(async (req) => {
+  // Verify webhook signature
+  const signature = req.headers.get('svix-signature')
+  if (!signature) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), { 
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    })
+  }
+  
+  try {
+    const body = await req.text()
+    const payload = JSON.parse(body)
+    
+    // Handle different webhook events
+    switch (payload.type) {
+      case 'organization.created':
+        await handleOrganizationCreated(payload.data)
+        break
+        
+      case 'organizationMembership.created':
+        await handleMembershipCreated(payload.data)
+        break
+        
+      case 'organizationMembership.deleted':
+        await handleMembershipDeleted(payload.data)
+        break
+    }
+    
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { 'Content-Type': 'application/json' }
+    })
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), { 
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    })
+  }
+})
+
+async function handleOrganizationCreated(data) {
+  // Insert organization into Supabase
+  const { error } = await supabase
+    .from('organizations')
+    .insert({
+      clerk_org_id: data.id,
+      name: data.name
+    })
+    
+  if (error) throw error
+}
+
+async function handleMembershipCreated(data) {
+  // Get organization ID from Clerk org ID
+  const { data: org, error: orgError } = await supabase
+    .from('organizations')
+    .select('id')
+    .eq('clerk_org_id', data.organization.id)
+    .single()
+    
+  if (orgError) throw orgError
+  
+  // Add member to organization
+  const { error } = await supabase
+    .from('organization_members')
+    .insert({
+      organization_id: org.id,
+      user_id: data.public_user_data.user_id,
+      role: data.role === 'org:admin' ? 'admin' : 'member'
+    })
+    
+  if (error) throw error
+}
+
+async function handleMembershipDeleted(data) {
+  // Get organization ID from Clerk org ID
+  const { data: org, error: orgError } = await supabase
+    .from('organizations')
+    .select('id')
+    .eq('clerk_org_id', data.organization.id)
+    .single()
+    
+  if (orgError) throw orgError
+  
+  // Remove member from organization
+  const { error } = await supabase
+    .from('organization_members')
+    .delete()
+    .match({
+      organization_id: org.id,
+      user_id: data.public_user_data.user_id
+    })
+    
+  if (error) throw error
+}
+```
+
+### 3. Create React Components for Organization Selection
+
+```tsx
+// src/components/OrganizationSwitcher.tsx
+import { useState, useEffect } from 'react'
+import { useOrganization, useOrganizationList } from '@clerk/clerk-react'
+import { useSupabaseClient } from '../lib/supabase'
+
+export function OrganizationSwitcher() {
+  const { organization } = useOrganization()
+  const { userMemberships } = useOrganizationList()
+  const supabase = useSupabaseClient()
+  const [orgData, setOrgData] = useState([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    if (organization) {
+      fetchOrganizationData()
+    }
+  }, [organization, supabase])
+
+  async function fetchOrganizationData() {
+    try {
+      setLoading(true)
+      
+      // Get organization ID from Clerk org ID
+      const { data: org, error: orgError } = await supabase
+        .from('organizations')
+        .select('id')
+        .eq('clerk_org_id', organization.id)
+        .single()
+        
+      if (orgError) throw orgError
+      
+      // Get organization data
+      const { data, error } = await supabase
+        .from('organization_data')
+        .select('*')
+        .eq('organization_id', org.id)
+        
+      if (error) throw error
+      
+      setOrgData(data || [])
+    } catch (error) {
+      console.error('Error fetching organization data:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div>
+      <h2>Organization: {organization?.name}</h2>
+      
+      <select 
+        onChange={(e) => {
+          const orgId = e.target.value
+          if (orgId) {
+            window.location.href = `/org/${orgId}`
+          }
+        }}
+        value={organization?.id || ''}
+      >
+        <option value="">Select an organization</option>
+        {userMemberships.data?.map((membership) => (
+          <option key={membership.organization.id} value={membership.organization.id}>
+            {membership.organization.name}
+          </option>
+        ))}
+      </select>
+      
+      {loading ? (
+        <p>Loading organization data...</p>
+      ) : (
+        <div>
+          <h3>Organization Data</h3>
+          <ul>
+            {orgData.map(item => (
+              <li key={item.id}>{item.name}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
+## Best Practices Summary
+
+1. **Security**
+   - Use Row Level Security (RLS) policies to control data access
+   - Store user ID in each table needing access control
+   - Create specific policies for each operation type
+   - Validate user authorization in Cloudflare Workers
+
+2. **Performance**
+   - Add indexes to user_id columns
+   - Cache Supabase clients to prevent recreation on each render
+   - Use the `requesting_user_id()` function in policies
+   - Implement proper loading states in components
+
+3. **Integration**
+   - Keep Clerk as the source of truth for user identity
+   - Use webhooks to sync data between Clerk and Supabase
+   - Implement proper error handling for auth failures
+   - Create helper hooks for authenticated Supabase clients
+
+4. **Multi-tenancy**
+   - Use Clerk Organizations for B2B applications
+   - Implement organization-based RLS policies
+   - Create middleware to validate organization access
+   - Sync organization changes via webhooks
+
+5. **Storage**
+   - Store files in organization or user-specific folders
+   - Use the user's ID in the storage path
+   - Apply appropriate RLS policies to storage buckets
+   - Implement proper file validation before upload 

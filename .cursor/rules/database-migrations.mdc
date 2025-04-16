@@ -1,0 +1,342 @@
+---
+# Specify the following for Cursor rules
+description: Guidelines for writing Postgres migrations
+globs: ""**/migrations/**/*.sql, **/supabase/migrations/**/*.sql"
+---
+
+# Database: Create Migration
+
+You are a PostgreSQL expert specializing in creating secure, reliable database migrations for Supabase projects.
+
+## Migration File Structure and Naming
+
+When creating a database migration file, follow these guidelines:
+
+1. **File Location**: Place all migration files in the `supabase/migrations/` directory.
+
+2. **Naming Convention**: Use the format `YYYYMMDDHHmmss_short_description.sql` with timestamps in UTC:
+   - `YYYY`: Four-digit year (e.g., 2024)
+   - `MM`: Two-digit month (01-12)
+   - `DD`: Two-digit day (01-31)
+   - `HH`: Two-digit hour in 24-hour format (00-23)
+   - `mm`: Two-digit minute (00-59)
+   - `ss`: Two-digit second (00-59)
+   - `short_description`: Brief snake_case description of the migration
+
+   Example: `20240415123045_create_user_profiles.sql`
+
+3. **File Creation**: Generate migration files using the Supabase CLI:
+   ```bash
+   npx supabase migration new create_user_profiles
+   ```
+
+## Migration Content Best Practices
+
+### Documentation and Comments
+
+- Begin each migration file with a header comment describing its purpose, affected tables/columns, and any special considerations.
+- Include thorough comments explaining the purpose of each migration step.
+- Add explicit warnings for destructive operations (DROP, ALTER, TRUNCATE).
+- Document any RLS policies created or modified.
+
+```sql
+-- Migration: Create user profiles table
+-- Description: Adds a profiles table linked to auth.users with RLS policies
+-- Date: 2024-04-15
+
+-- Create profiles table
+create table public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  username text unique not null,
+  full_name text,
+  avatar_url text,
+  website text,
+  updated_at timestamptz not null default now()
+);
+
+-- Add comment
+comment on table public.profiles is 'User profile information associated with authenticated users';
+
+-- Enable RLS
+alter table public.profiles enable row level security;
+```
+
+### SQL Style and Safety
+
+- Write all SQL in lowercase for consistency.
+- Use explicit schema references (e.g., `public.table_name`).
+- Add NOT NULL constraints where appropriate to maintain data integrity.
+- Include foreign key constraints with appropriate ON DELETE actions.
+- Use `timestamptz` for timestamps to handle time zones properly.
+- When altering existing tables in production, use safe approaches:
+  - Add nullable columns instead of requiring values
+  - Use multi-step migrations for complex changes
+
+### RLS Security
+
+- **Always** enable Row Level Security on new tables:
+  ```sql
+  alter table public.table_name enable row level security;
+  ```
+
+- Create appropriate RLS policies covering all operations (SELECT, INSERT, UPDATE, DELETE):
+  ```sql
+  -- Allow users to manage their own profiles
+  create policy "Users can view their own profile" 
+  on public.profiles 
+  for select 
+  to authenticated 
+  using ((select auth.uid()) = id);
+
+  create policy "Users can update their own profile" 
+  on public.profiles 
+  for update 
+  to authenticated 
+  using ((select auth.uid()) = id) 
+  with check ((select auth.uid()) = id);
+  ```
+
+- Consider public access needs:
+  ```sql
+  -- For public data
+  create policy "Public data is viewable by everyone" 
+  on public.public_data 
+  for select 
+  to authenticated, anon 
+  using (true);
+  ```
+
+### Performance Considerations
+
+- Create appropriate indexes for columns used in WHERE clauses, JOINs, and ORDER BY:
+  ```sql
+  create index idx_table_column on public.table_name(column_name);
+  ```
+
+- For text columns that will be searched, consider adding GIN indexes with the pg_trgm extension:
+  ```sql
+  create extension if not exists pg_trgm;
+  create index idx_table_text_search on public.table_name using gin (column_name gin_trgm_ops);
+  ```
+
+- Add appropriate CHECK constraints to enforce business rules.
+
+### Transactions
+
+- Each migration file should be wrapped in a transaction to ensure it's applied atomically:
+  ```sql
+  begin;
+    -- migration steps here
+  commit;
+  ```
+
+- For migrations that can't be run in a transaction (e.g., CREATE INDEX CONCURRENTLY), split into multiple migration files.
+
+## Real-World Migration Examples
+
+### Creating a New Table with RLS
+
+```sql
+-- Create a new tasks table with RLS
+create table public.tasks (
+  id bigint generated always as identity primary key,
+  title text not null,
+  description text,
+  status text not null default 'pending',
+  due_date timestamptz,
+  created_by uuid not null references auth.users(id) on delete cascade,
+  assigned_to uuid references auth.users(id) on delete set null,
+  project_id bigint references public.projects(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+comment on table public.tasks is 'Tasks that can be assigned to users within projects';
+
+-- Enable RLS
+alter table public.tasks enable row level security;
+
+-- Create appropriate indexes
+create index idx_tasks_created_by on public.tasks(created_by);
+create index idx_tasks_assigned_to on public.tasks(assigned_to);
+create index idx_tasks_project_id on public.tasks(project_id);
+create index idx_tasks_status on public.tasks(status);
+create index idx_tasks_due_date on public.tasks(due_date);
+
+-- Add RLS policies
+create policy "Users can view tasks they created or are assigned to"
+on public.tasks
+for select
+to authenticated
+using (
+  created_by = (select auth.uid()) or
+  assigned_to = (select auth.uid()) or
+  project_id in (
+    select project_id 
+    from public.project_members 
+    where user_id = (select auth.uid())
+  )
+);
+
+create policy "Users can create tasks in their projects"
+on public.tasks
+for insert
+to authenticated
+with check (
+  project_id in (
+    select project_id 
+    from public.project_members 
+    where user_id = (select auth.uid())
+  )
+);
+
+create policy "Users can update tasks they created or are assigned to"
+on public.tasks
+for update
+to authenticated
+using (
+  created_by = (select auth.uid()) or
+  assigned_to = (select auth.uid())
+)
+with check (
+  project_id in (
+    select project_id 
+    from public.project_members 
+    where user_id = (select auth.uid())
+  )
+);
+
+create policy "Users can delete tasks they created"
+on public.tasks
+for delete
+to authenticated
+using (created_by = (select auth.uid()));
+```
+
+### Adding a Column to an Existing Table
+
+```sql
+-- Add a verification status column to the profiles table
+alter table public.profiles 
+add column is_verified boolean not null default false;
+
+comment on column public.profiles.is_verified is 'Whether this user has been verified';
+
+-- Add an index for the new column
+create index idx_profiles_is_verified on public.profiles(is_verified);
+
+-- Update existing RLS policies if necessary
+create policy "Admins can update verification status"
+on public.profiles
+for update
+to authenticated
+using (
+  -- Check if user is an admin
+  (select is_admin from public.user_roles where user_id = (select auth.uid()))
+)
+with check (
+  -- Only allow updating the is_verified column
+  coalesce(
+    id = (select auth.uid()),
+    false
+  )
+  or
+  (select is_admin from public.user_roles where user_id = (select auth.uid()))
+);
+```
+
+### Implementing a Function and Trigger
+
+```sql
+-- Create a function to update the updated_at timestamp
+create or replace function public.handle_updated_at()
+returns trigger
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+-- Create triggers on tables that need to track update time
+create trigger set_updated_at
+before update on public.profiles
+for each row
+execute function public.handle_updated_at();
+
+create trigger set_updated_at
+before update on public.tasks
+for each row
+execute function public.handle_updated_at();
+```
+
+### Schema Changes for Clerk Integration
+
+```sql
+-- Add a column to store Clerk user IDs
+alter table public.profiles
+add column clerk_user_id text unique;
+
+comment on column public.profiles.clerk_user_id is 'External Clerk user ID for authentication';
+
+-- Create an index for the Clerk user ID
+create index idx_profiles_clerk_user_id on public.profiles(clerk_user_id);
+
+-- Update RLS policies to work with Clerk JWT authentication
+create policy "Users can access their own profiles with Clerk"
+on public.profiles
+for select
+to authenticated
+using (
+  clerk_user_id = current_setting('request.jwt.claims', true)::json->>'sub'
+);
+
+create policy "Users can update their own profiles with Clerk"
+on public.profiles
+for update
+to authenticated
+using (
+  clerk_user_id = current_setting('request.jwt.claims', true)::json->>'sub'
+)
+with check (
+  clerk_user_id = current_setting('request.jwt.claims', true)::json->>'sub'
+);
+```
+
+## Managing Migrations in Production
+
+1. **Never directly edit your production database**:
+   - All changes should be done through migrations
+   - Use the Supabase CLI to apply migrations
+
+2. **Testing Migrations**:
+   - Test all migrations in a staging environment before applying to production
+   - Use the `--dry-run` flag to preview changes: `npx supabase db push --dry-run`
+
+3. **Deployment Process**:
+   - Document each migration thoroughly
+   - Consider database size and query impact when scheduling deployments
+   - For large databases, schedule migrations during low-traffic periods
+   - Always backup your database before applying migrations
+
+4. **CI/CD Integration**:
+   - Integrate migrations into your CI/CD pipeline
+   - Automated testing should verify migrations work as expected
+   - Example GitHub Actions workflow:
+   ```yaml
+   name: Deploy Migrations
+   on:
+     push:
+       branches: [main]
+   jobs:
+     deploy:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v3
+         - uses: supabase/setup-cli@v1
+         - run: supabase link --project-ref $PROJECT_REF
+         - run: supabase db push
+   ``` 
